@@ -1,0 +1,57 @@
+{
+  "name": "Bollinger Bands + RSI + Rejection Candles",
+  "version": "1.0.0",
+  "description": "Strategie principale du Plan 1 — Bollinger Bands (20,2) + RSI (14) avec confirmation de pattern de rejet",
+  "author": "Trading Bot Team",
+  "parameters": {
+    "bollinger_bands": {
+      "period": 20,
+      "std_dev": 2.0,
+      "applied_price": "close"
+    },
+    "rsi": {
+      "period": 14,
+      "oversold": 30.0,
+      "overbought": 70.0
+    },
+    "rejection_candle": {
+      "wick_threshold": 0.50,
+      "min_body_ratio": 0.3,
+      "enabled": true
+    },
+    "entry_rules": {
+      "CALL": {
+        "condition_1": "Close ET Open sous la bande inférieure de Bollinger",
+        "condition_2": "RSI < 30 (survente)",
+        "condition_3": "Pattern de rejet haussier (longue mèche inférieure)",
+        "min_conditions_required": 2,
+        "min_score": 50.0
+      },
+      "PUT": {
+        "condition_1": "Close ET Open au-dessus de la bande supérieure de Bollinger",
+        "condition_2": "RSI > 70 (surachat)",
+        "condition_3": "Pattern de rejet baissier (longue mèche supérieure)",
+        "min_conditions_required": 2,
+        "min_score": 50.0
+      }
+    },
+    "risk_management": {
+      "risk_per_trade_pct": 2.0,
+      "risk_reward_ratio": 5.0,
+      "sl_pips": 20,
+      "tp_pips": 100,
+      "max_trades_per_day": 2,
+      "daily_stop_loss_pct": 5.0,
+      "daily_profit_target_pct": 4.0,
+      "max_drawdown_pct": 20.0
+    },
+    "timeframes": ["M1", "M5"],
+    "recommended_symbols": ["R_75", "R_100", "1HZ75V", "1HZ100V"]
+  },
+  "notes": [
+    "Ne JAMAIS augmenter la taille de lot pendant les 3-6 premiers mois",
+    "1 ou 2 trades par jour maximum, puis arreter",
+    "Focus sur $20/jour avec $500 de capital (4%)",
+    "La discipline est la cle — le bot applique ces regles sans emotion"
+  ]
+}

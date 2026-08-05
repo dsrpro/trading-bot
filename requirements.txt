@@ -1,0 +1,18 @@
+# Core
+numpy>=1.24.0
+websockets>=12.0
+
+# Optional — TA-Lib (technical indicators accelerator)
+# pip install TA-Lib  # Requires manual compilation on some systems
+# If not available, pure NumPy fallback is used automatically
+
+# Testing
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+
+# Optional — Production dependencies
+# pandas>=2.0.0
+# fastapi>=0.110.0
+# uvicorn>=0.29.0
+# sqlalchemy>=2.0.0
+# redis>=5.0.0
