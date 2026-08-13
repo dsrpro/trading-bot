@@ -84,6 +84,31 @@ class RiskManager:
         self.losing_trades: int = 0
         self.total_pnl: float = 0.0
 
+    def set_initial_capital(self, capital: float) -> None:
+        """Reinitialise le capital de reference depuis le solde reel du compte.
+
+        A utiliser au demarrage du paper/live trading apres avoir recupere le
+        solde via l'API, afin que le calcul de position et le P&L soient
+        coherents avec le vrai solde du compte.
+
+        Args:
+            capital: Solde reel du compte (ex: 9987.41 USD).
+        """
+        if capital <= 0:
+            self.logger.warning(f"Capital invalide ignore: {capital}")
+            return
+        self.initial_capital = capital
+        self.current_capital = capital
+        self.peak_capital = capital
+        self._daily_start_capital = capital
+        self._daily_pnl = 0.0
+        self._trades_today = 0
+        self.total_pnl = 0.0
+        self.winning_trades = 0
+        self.losing_trades = 0
+        self.total_trades = 0
+        self.logger.info(f"Capital initialise depuis le solde du compte: ${capital:.2f}")
+
     def _reset_daily_if_needed(self) -> None:
         """Reinitialise les compteurs quotidiens si un nouveau jour commence."""
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")

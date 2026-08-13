@@ -84,11 +84,11 @@ class TickStorage:
         with self._get_conn() as conn:
             for tick in ticks:
                 try:
-                    conn.execute(
+                    cursor = conn.execute(
                         "INSERT OR IGNORE INTO ticks (epoch, symbol, price) VALUES (?, ?, ?)",
                         (int(tick["epoch"]), tick.get("symbol", ""), float(tick.get("quote", 0))),
                     )
-                    inserted += 1
+                    inserted += cursor.rowcount
                 except Exception as e:
                     self.logger.debug(f"Erreur insertion tick: {e}")
             conn.commit()
@@ -107,7 +107,7 @@ class TickStorage:
         with self._get_conn() as conn:
             for c in candles:
                 try:
-                    conn.execute(
+                    cursor = conn.execute(
                         """INSERT OR IGNORE INTO candles
                            (timestamp, symbol, timeframe, open, high, low, close, volume)
                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -122,7 +122,7 @@ class TickStorage:
                             c.volume,
                         ),
                     )
-                    inserted += 1
+                    inserted += cursor.rowcount
                 except Exception as e:
                     self.logger.debug(f"Erreur insertion chandelier: {e}")
             conn.commit()

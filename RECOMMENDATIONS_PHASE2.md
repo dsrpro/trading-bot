@@ -229,6 +229,83 @@ Si < 2 critères → retour en Phase 1 (backtest) pour réviser la stratégie.
 
 ---
 
+## 🔑 Procédure OTP — Accès Trading Complet
+
+### Qu'est-ce que l'OTP ?
+
+L'API Deriv v2 utilise un flux **OTP (One-Time Password)** pour l'accès trading. Contrairement à l'ancienne API où on envoyait juste `{"authorize": token}`, la nouvelle API nécessite :
+
+1. **POST HTTP** → obtient une URL WebSocket dynamique (valide ~5 minutes)
+2. **Connexion WebSocket** → à cette URL pour le trading
+
+### Étapes pour activer l'OTP
+
+#### Prérequis
+
+- [x] Token API actif dans le dashboard Deriv (https://app.deriv.com/account/api-token)
+- [x] Token avec les scopes : **Read, Trade, Payments, Admin**
+- [x] `DERIV_TOKEN` configuré dans `config/settings.env`
+- [x] `DERIV_APP_ID=1089` dans `config/settings.env`
+
+#### Étape 1 : Trouver son Account ID
+
+L'Account ID est le login ID de votre compte Deriv. Format :
+- Compte démo : `VRTC...`
+- Compte réel : `CR...`
+
+**Méthode 1** : Dans le dashboard Deriv, Menu → Compte → ID du compte
+
+**Méthode 2** : Via l'API publique (pas encore implémenté)
+
+#### Étape 2 : Lancer le test OTP
+
+```bash
+cd trading-bot
+python test_otp_trading.py
+```
+
+Le script va :
+1. Se connecter à l'API publique (vérification que tout fonctionne)
+2. Envoyer la requête POST HTTP à l'endpoint OTP
+3. Recevoir l'URL WebSocket dynamique
+4. Se connecter à cette URL
+5. Vérifier le solde du compte
+6. Tester une proposition de contrat (sans exécution)
+
+#### Étape 3 : Code implémenté
+
+```python
+# Dans src/deriv_client.py
+
+async def connect_trading(self, token: str, account_id: str) -> bool:
+    """Flux complet OTP:
+    1. POST HTTP à /trading/v1/options/accounts/{account_id}/otp
+       Headers: Deriv-App-ID, Authorization: Bearer <token>
+    2. Récupère websocket_url de la réponse
+    3. Connexion WebSocket à cette URL
+    4. Mode trading activé → get_balance, get_proposal, buy_contract disponibles
+    """
+```
+
+#### Étape 4 : Lancer le paper trading
+
+```bash
+# Une fois l'OTP validé
+python -m src.main paper
+```
+
+### Dépannage OTP
+
+| Erreur | Cause probable | Solution |
+|---|---|---|
+| `HTTPError 401` | Token invalide ou expiré | Régénérer le token dans le dashboard |
+| `HTTPError 403` | Scopes insuffisants | Ajouter Read, Trade, Payments, Admin |
+| `HTTPError 404` | Account ID incorrect | Vérifier l'ID dans le dashboard |
+| `Pas de websocket_url` | Format de réponse inattendu | Vérifier la version de l'API |
+| `WebSocket timeout` | URL dynamique expirée | Relancer (l'URL est valide ~5 min) |
+
+---
+
 ## ⚠️ Risques et Limitations
 
 1. **Données synthétiques ≠ marché réel** : Le comportement sur données Deriv réelles peut différer significativement.

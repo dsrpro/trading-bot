@@ -56,6 +56,16 @@ Si TA-Lib n'est pas installé, le bot utilise automatiquement NumPy pur (plus le
 python -m src.main backtest
 ```
 
+### 1b. Backtesting réel sur 3 ans Deriv
+```bash
+python backtest_live.py
+```
+
+Ce mode utilise `BACKTEST_YEARS=3`, `MARKET_SYMBOL` et `TIMEFRAME` depuis
+`config/settings.env`. Il récupère les bougies OHLC Deriv par pagination,
+les met en cache dans `data/market_data.db`, puis bloque le backtest si la
+couverture historique ne représente pas vraiment la fenêtre demandée.
+
 ### 2. Dry-Run (simulation temps réel sans API)
 ```bash
 python -m src.main dry-run --duration 10

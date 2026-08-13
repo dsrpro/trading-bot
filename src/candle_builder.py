@@ -248,6 +248,42 @@ class CandleBuilder:
         self._candles.clear()
         self._tick_count_in_candle = 0
 
+    def preload_candles(self, candles: list[Candle]) -> int:
+        """Injection d'un historique de bougies fermees avant le flux live.
+
+        Les bougies doivent etre triees chronologiquement et deduplicates.
+        Toutes les bougies sauf la derniere sont placees dans l'historique.
+        La derniere devient la bougie courante (encore en construction) afin
+        d'etre completee par les ticks live du meme timeframe.
+
+        Args:
+            candles: Bougies historiques (au moins une).
+
+        Returns:
+            Nombre de bougies fermees prechargees.
+        """
+        if not candles:
+            return 0
+
+        self._candles.clear()
+        self._current_candle = None
+        self._current_start = None
+        self._tick_count_in_candle = 0
+
+        # Toutes les bougies sauf la derniere sont historiques (fermees)
+        for candle in candles[:-1]:
+            candle.is_closed = True
+            self._candles.append(candle)
+
+        # La derniere devient la bougie courante (en construction)
+        last = candles[-1]
+        last.is_closed = False
+        self._current_candle = last
+        self._current_start = int(last.timestamp)
+        self._tick_count_in_candle = int(last.volume) if last.volume > 0 else 1
+
+        return len(self._candles)
+
     def _get_candle_start(self, timestamp: float) -> float:
         """Calcule le timestamp de debut du chandelier pour un tick donne.
 

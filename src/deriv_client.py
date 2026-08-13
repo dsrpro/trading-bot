@@ -3,6 +3,13 @@
 Utilise les nouveaux endpoints:
     - Public (donnees de marche): wss://api.derivws.com/trading/v1/options/ws/public
     - Trading (apres OTP): POST HTTP puis WebSocket dynamique
+
+Flux OTP complet:
+    1. POST https://api.derivws.com/trading/v1/options/accounts/{account_id}/otp
+       Headers: Deriv-App-ID, Authorization: Bearer <token>
+    2. Reponse: {"websocket_url": "wss://...", ...}
+    3. Connexion WebSocket a l'URL dynamique
+    4. Trading authentifie pret
 """
 
 from __future__ import annotations
@@ -10,8 +17,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import ssl
 import time
 from typing import Any, Callable, Optional
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
 
 import websockets
 from websockets.exceptions import ConnectionClosed, WebSocketException
@@ -120,6 +130,142 @@ class DerivClient:
                 future.set_exception(ConnectionError("Deconnecte"))
         self._pending_requests.clear()
 
+    async def reconnect(self) -> bool:
+        """Tente de reconnecter le client si la connexion est perdue."""
+        self.logger.info("Reconnexion Deriv demandee")
+        await self.disconnect()
+        return await self.connect()
+
+    # ── Trading Authentifié (OTP) ──────────────────────────────────
+
+    def _request_otp_sync(self, token: str, account_id: str) -> Optional[dict]:
+        """Etape 1: Requete HTTP POST pour obtenir l'URL WebSocket de trading.
+
+        Appele de maniere synchrone (execute dans un thread separe par asyncio).
+
+        Args:
+            token: Token API Deriv (PAT).
+            account_id: ID du compte Deriv (ex: "CR90000000").
+
+        Returns:
+            Dictionnaire avec 'websocket_url' ou None si echec.
+        """
+        url = self.OTP_API_URL.format(account_id=account_id)
+        data = json.dumps({}).encode("utf-8")
+
+        req = Request(
+            url,
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "Deriv-App-ID": self.config.deriv_app_id,
+                "Authorization": f"Bearer {token}",
+            },
+            method="POST",
+        )
+
+        try:
+            ctx = ssl.create_default_context()
+            with urlopen(req, context=ctx, timeout=15) as response:
+                body = json.loads(response.read().decode("utf-8"))
+                self.logger.info(f"OTP response recue: {json.dumps(body)[:300]}")
+                return body
+        except HTTPError as e:
+            self.logger.error(f"OTP HTTP error {e.code}: {e.reason}")
+            try:
+                error_body = json.loads(e.read().decode("utf-8"))
+                self.logger.error(f"OTP error body: {json.dumps(error_body)[:300]}")
+            except Exception:
+                pass
+            return None
+        except URLError as e:
+            self.logger.error(f"OTP URL error: {e.reason}")
+            return None
+        except Exception as e:
+            self.logger.error(f"OTP unexpected error: {e}")
+            return None
+
+    async def connect_trading(self, token: str, account_id: str) -> bool:
+        """Etablit une connexion WebSocket de trading via OTP.
+
+        Flux complet:
+            1. POST HTTP → obtient websocket_url
+            2. Connexion WebSocket a l'URL dynamique
+            3. Pret pour get_balance, get_proposal, buy_contract
+
+        Args:
+            token: Token API Deriv (PAT).
+            account_id: ID du compte Deriv (trouvable dans le dashboard).
+
+        Returns:
+            True si la connexion trading est etablie, False sinon.
+        """
+        self._running = True
+        self._mode = "trading"
+
+        # Étape 1: Requête OTP (exécutée dans un thread pour ne pas bloquer)
+        self.logger.info(f"Etape 1/2: Requete OTP pour le compte {account_id}...")
+        loop = asyncio.get_event_loop()
+        otp_response = await loop.run_in_executor(
+            None, self._request_otp_sync, token, account_id
+        )
+
+        if otp_response is None:
+            self.logger.error("Echec de la requete OTP — verifiez le token et l'account_id")
+            return False
+
+        if otp_response.get("error"):
+            err = otp_response["error"]
+            self.logger.error(f"OTP erreur: {err.get('code', '')} - {err.get('message', '')}")
+            return False
+
+        # Nouvelle API v2: la reponse a la forme {"data": {"url": "wss://..."}}
+        websocket_url = otp_response.get("websocket_url")
+        if not websocket_url:
+            data = otp_response.get("data", {})
+            websocket_url = data.get("url") if isinstance(data, dict) else None
+        if not websocket_url:
+            self.logger.error(f"OTP reponse sans websocket_url: {json.dumps(otp_response)[:300]}")
+            return False
+
+        # Étape 2: Connexion WebSocket à l'URL dynamique
+        self.logger.info(f"Etape 2/2: Connexion WebSocket trading...")
+        attempt = 0
+        while attempt < self.config.reconnect_attempts and self._running:
+            attempt += 1
+            try:
+                self._ws = await websockets.connect(
+                    websocket_url,
+                    ping_interval=30,
+                    ping_timeout=10,
+                    close_timeout=5,
+                    max_size=2**20,
+                )
+                self._req_id = 0
+                self._connected = True
+                self._mode = "trading"
+                self.logger.info(f"WebSocket trading connecte! (tentative {attempt})")
+
+                # Lancer la boucle de lecture
+                asyncio.create_task(self._read_loop())
+                return True
+
+            except (ConnectionClosed, WebSocketException, OSError) as e:
+                self._connected = False
+                self.logger.warning(f"Connexion trading perdue (tentative {attempt}): {e}")
+                if attempt < self.config.reconnect_attempts:
+                    delay = self.config.reconnect_delay_seconds * (2 ** (attempt - 1))
+                    self.logger.info(f"Reconnexion dans {delay:.1f}s...")
+                    await asyncio.sleep(delay)
+            except Exception as e:
+                self._connected = False
+                self.logger.error(f"Erreur connexion trading: {e}", exc_info=True)
+                break
+
+        self._connected = False
+        self.logger.error("Impossible de se connecter au trading apres toutes les tentatives")
+        return False
+
     async def subscribe_ticks(self, symbol: str) -> Optional[dict]:
         """Souscrit au flux de ticks pour un symbole (API Deriv v2).
 
@@ -143,6 +289,36 @@ class DerivClient:
         """
         return await self._send_request({"active_symbols": "full"})
 
+    async def get_candles(
+        self,
+        symbol: str,
+        *,
+        count: int = 500,
+        granularity: int = 60,
+        end: str = "latest",
+    ) -> Optional[dict]:
+        """Recupere les bougies OHLC historiques (API Deriv v2).
+
+        Args:
+            symbol: Symbole du marche (ex: "1HZ100V").
+            count: Nombre de bougies a recuperer.
+            granularity: Taille des bougies en secondes (60 = M1).
+            end: Borne de fin ("latest" ou epoch).
+
+        Returns:
+            Reponse contenant la cle "candles", ou None si echec.
+        """
+        return await self._send_request(
+            {
+                "ticks_history": symbol,
+                "style": "candles",
+                "granularity": granularity,
+                "count": count,
+                "end": end,
+            },
+            timeout=30.0,
+        )
+
     async def unsubscribe_ticks(self, symbol: str) -> Optional[dict]:
         """Se desabonne du flux de ticks."""
         return await self._send_request({"forget_all": "ticks"})
@@ -164,7 +340,7 @@ class DerivClient:
         return await self._send_request({
             "proposal": 1,
             "contract_type": contract_type,
-            "symbol": symbol,
+            "underlying_symbol": symbol,
             "amount": amount,
             "basis": basis,
             "duration": duration,
@@ -241,18 +417,11 @@ class DerivClient:
                         future.set_result(message)
 
                 # Traiter les ticks (format standard: {"tick": {...}})
-                if "tick" in message:
-                    tick = message["tick"]
-                    # Nouveau format: le tick peut avoir la structure {"tick": {"quote": ..., "epoch": ...}}
-                    for cb in self._tick_callbacks:
-                        try:
-                            cb(tick)
-                        except Exception as e:
-                            self.logger.error(f"Erreur callback tick: {e}")
-
-                # Traiter les ticks_history updates
-                if message.get("msg_type") == "tick":
-                    tick = message.get("tick", message)
+                # Un seul dispatch: le champ "tick" est present sur tous les messages
+                # de tick (y compris les updates msg_type="tick"), ce qui evite le
+                # double appel du meme callback.
+                tick = message.get("tick")
+                if tick is not None:
                     for cb in self._tick_callbacks:
                         try:
                             cb(tick)

@@ -26,6 +26,7 @@ class Config:
     deriv_api_url: str = "wss://ws.derivws.com/websockets/v3"
     deriv_token: str = ""
     deriv_account_type: str = "demo"  # "demo" ou "real"
+    deriv_account_id: str = ""  # ex: "DOT92983989" (demo) — requis pour l'OTP trading
 
     # --- Trading ---
     market_symbol: str = "R_75"
@@ -64,6 +65,11 @@ class Config:
     reconnect_attempts: int = 5
     reconnect_delay_seconds: float = 2.0
     tick_buffer_size: int = 1000
+    preload_candles_count: int = 300  # Bougies OHLC prechargees au demarrage
+
+    # --- Telegram ---
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
 
     # --- Logging ---
     log_level: str = "INFO"
@@ -100,6 +106,7 @@ def load_config(env_file: Optional[str] = None) -> Config:
         deriv_api_url=_env_str("DERIV_API_URL", "wss://ws.derivws.com/websockets/v3"),
         deriv_token=_env_str("DERIV_TOKEN", ""),
         deriv_account_type=_env_str("DERIV_ACCOUNT_TYPE", "demo"),
+        deriv_account_id=_env_str("DERIV_ACCOUNT_ID", ""),
         market_symbol=_env_str("MARKET_SYMBOL", "R_75"),
         timeframe=_env_str("TIMEFRAME", "M1"),
         max_trades_per_day=_env_int("MAX_TRADES_PER_DAY", 2),
@@ -124,6 +131,9 @@ def load_config(env_file: Optional[str] = None) -> Config:
         reconnect_attempts=_env_int("RECONNECT_ATTEMPTS", 5),
         reconnect_delay_seconds=_env_float("RECONNECT_DELAY_SECONDS", 2.0),
         tick_buffer_size=_env_int("TICK_BUFFER_SIZE", 1000),
+        preload_candles_count=_env_int("PRELOAD_CANDLES_COUNT", 300),
+        telegram_bot_token=_env_str("TELEGRAM_BOT_TOKEN", ""),
+        telegram_chat_id=_env_str("TELEGRAM_CHAT_ID", ""),
         log_level=_env_str("LOG_LEVEL", "INFO"),
         log_format=_env_str("LOG_FORMAT", "json"),
     )

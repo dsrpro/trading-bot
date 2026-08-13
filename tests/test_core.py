@@ -431,7 +431,7 @@ class TestStrategyEngine:
         assert isinstance(signal.rsi_value, float)
         assert isinstance(signal.bb_upper, float)
         assert isinstance(signal.bb_lower, float)
-        assert signal.symbol == "R_75"
+        assert signal.symbol == strategy_engine.config.market_symbol
         assert signal.strategy == "bollinger_rsi"
 
     def test_reset(self, strategy_engine):

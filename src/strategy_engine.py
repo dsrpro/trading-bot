@@ -201,17 +201,24 @@ class StrategyEngine:
                 current_candle.timestamp if current_candle else candles[-1].timestamp
             )
 
-            # Calcul des niveaux de SL/TP en pips
+            # Calcul des niveaux de SL/TP base sur l'ATR (volatilite reelle).
+            # Utilise les multiplicateurs ATR definis en tete de classe :
+            #   SL = 1.5x ATR, TP = 3.0x ATR (R:R ~1:2).
             if last_atr > 0:
-                signal.stop_loss = last_close - self.config.sl_pips * (last_atr / 100.0)
-                signal.take_profit = last_close + self.config.tp_pips * (last_atr / 100.0)
+                if signal.direction == SignalDirection.CALL:
+                    signal.stop_loss = last_close - self.atr_sl_multiplier * last_atr
+                    signal.take_profit = last_close + self.atr_tp_multiplier * last_atr
+                else:
+                    signal.stop_loss = last_close + self.atr_sl_multiplier * last_atr
+                    signal.take_profit = last_close - self.atr_tp_multiplier * last_atr
             else:
-                signal.stop_loss = last_close * 0.99
-                signal.take_profit = last_close * 1.05
-
-            # Inverser SL/TP pour PUT
-            if signal.direction == SignalDirection.PUT:
-                signal.stop_loss, signal.take_profit = signal.take_profit, signal.stop_loss
+                # Fallback si ATR indisponible : 1% / 5% autour du prix d'entree
+                if signal.direction == SignalDirection.CALL:
+                    signal.stop_loss = last_close * 0.99
+                    signal.take_profit = last_close * 1.05
+                else:
+                    signal.stop_loss = last_close * 1.01
+                    signal.take_profit = last_close * 0.95
 
             self.logger.info(
                 f"SIGNAL {signal.direction.value} | "

@@ -1,130 +1,52 @@
-"""Backtesting Phase 1 — 3 ans d'historique reel via l'API Deriv.
+"""Backtesting Phase 1 on real Deriv historical candles.
 
-Recupere l'historique des prix, construit les chandeliers M1,
-puis execute le backtester complet sur ces donnees reelles.
+This script uses three calendar years of OHLC candles by default.  It avoids
+the old tick-by-tick download path because three years of second-level ticks is
+too large and previously produced only a few days of usable M1 candles.
 """
 
-import asyncio
-import sys
-import json
-import time as _time
-from datetime import datetime, timezone, timedelta
-from pathlib import Path
+from __future__ import annotations
 
-import numpy as np
+import argparse
+import asyncio
+import json
+import sys
+import time as _time
+from datetime import datetime, timezone
+from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from src.config import Config, load_config
-from src.logger import setup_logger
-from src.deriv_client import DerivClient
-from src.candle_builder import Candle, CandleBuilder
 from src.backtester import Backtester
-
-
-async def fetch_historical_ticks(
-    client: DerivClient,
-    symbol: str,
-    start_epoch: int,
-    end_epoch: int,
-    logger
-) -> list[dict]:
-    """Recupere l'historique des ticks entre deux timestamps.
-
-    L'API limite a ~5000 ticks par requete, donc on pagine.
-    Chaque tick a une granularite de 1 seconde pour les indices 1s.
-
-    Args:
-        client: Client Deriv connecte.
-        symbol: Symbole (ex: "1HZ100V").
-        start_epoch: Timestamp de debut (secondes).
-        end_epoch: Timestamp de fin (secondes).
-        logger: Logger.
-
-    Returns:
-        Liste de dictionnaires de ticks tries chronologiquement.
-    """
-    all_ticks = []
-    current_end = end_epoch
-    max_requests = 500  # Securite
-    request_count = 0
-
-    logger.info(f"Recuperation historique {symbol}: "
-                f"{datetime.fromtimestamp(start_epoch)} -> {datetime.fromtimestamp(end_epoch)}")
-
-    while current_end > start_epoch and request_count < max_requests:
-        request_count += 1
-        payload = {
-            "ticks_history": symbol,
-            "end": str(current_end),
-            "start": start_epoch,
-            "adjust_start_time": 1,
-            "count": 5000,
-        }
-
-        resp = await client._send_request(payload, timeout=30.0)
-
-        if resp is None:
-            logger.warning(f"Timeout requete #{request_count}, reessai...")
-            await asyncio.sleep(1)
-            continue
-
-        if resp.get("error"):
-            err = resp["error"]
-            logger.error(f"Erreur API requete #{request_count}: {err.get('code')} - {err.get('message')}")
-            break
-
-        history = resp.get("history", {})
-        prices = history.get("prices", [])
-        times = history.get("times", [])
-
-        if not prices:
-            logger.info(f"Plus de ticks disponibles (requete #{request_count})")
-            break
-
-        for i, price in enumerate(prices):
-            epoch = int(times[i]) if i < len(times) else current_end
-            all_ticks.append({
-                "epoch": epoch,
-                "quote": float(price),
-                "symbol": symbol,
-            })
-
-        # Mise a jour: nouvelle fin = timestamp du premier tick recupere - 1
-        if times and len(times) > 0:
-            current_end = int(times[0]) - 1
-        else:
-            break
-
-        elapsed = end_epoch - current_end
-        pct = min(100.0, (elapsed / (end_epoch - start_epoch)) * 100.0) if end_epoch > start_epoch else 100.0
-        if request_count % 10 == 0:
-            logger.info(f"  Progression: {pct:.0f}% | {len(all_ticks)} ticks | "
-                        f"periode couverte: {datetime.fromtimestamp(current_end)}")
-
-        await asyncio.sleep(0.5)  # Rate limiting
-
-    # Trier par epoch croissant
-    all_ticks.sort(key=lambda t: t["epoch"])
-    logger.info(f"Historique recupere: {len(all_ticks)} ticks au total")
-    return all_ticks
+from src.candle_builder import Candle
+from src.config import load_config
+from src.deriv_client import DerivClient
+from src.historical_data import (
+    build_historical_window,
+    coverage_for_candles,
+    deduplicate_candles,
+    fetch_historical_candles,
+    load_cached_candles,
+    seconds_to_timeframe,
+    timeframe_to_seconds,
+)
+from src.logger import setup_logger
+from src.storage import TickStorage
 
 
 def ticks_to_candles(ticks: list[dict], timeframe_seconds: int = 60) -> list[Candle]:
-    """Convertit des ticks en chandeliers OHLC.
+    """Convert legacy tick dictionaries into OHLC candles.
 
-    Args:
-        ticks: Liste de dictionnaires de ticks (avec 'epoch', 'quote').
-        timeframe_seconds: Duree d'un chandelier en secondes (60 = M1).
-
-    Returns:
-        Liste de Candle tries chronologiquement.
+    Kept for manual experiments, but the real three-year backtest fetches
+    Deriv candles directly through fetch_historical_candles().
     """
+
     if not ticks:
         return []
 
-    candles = []
-    current_start = (ticks[0]["epoch"] // timeframe_seconds) * timeframe_seconds
+    timeframe = seconds_to_timeframe(timeframe_seconds)
+    candles: list[Candle] = []
+    current_start = (int(ticks[0]["epoch"]) // timeframe_seconds) * timeframe_seconds
     current_open = None
     current_high = float("-inf")
     current_low = float("inf")
@@ -132,26 +54,26 @@ def ticks_to_candles(ticks: list[dict], timeframe_seconds: int = 60) -> list[Can
     volume = 0
 
     for tick in ticks:
-        epoch = tick["epoch"]
+        epoch = int(tick["epoch"])
         price = float(tick["quote"])
         candle_start = (epoch // timeframe_seconds) * timeframe_seconds
 
         if candle_start != current_start:
-            # Fermer le chandelier precedent
             if current_open is not None:
-                candles.append(Candle(
-                    timestamp=current_start,
-                    open=current_open,
-                    high=current_high,
-                    low=current_low,
-                    close=current_close,
-                    volume=volume,
-                    symbol=tick.get("symbol", ""),
-                    timeframe=f"M{timeframe_seconds // 60}",
-                    is_closed=True,
-                ))
+                candles.append(
+                    Candle(
+                        timestamp=current_start,
+                        open=current_open,
+                        high=current_high,
+                        low=current_low,
+                        close=current_close,
+                        volume=volume,
+                        symbol=tick.get("symbol", ""),
+                        timeframe=timeframe,
+                        is_closed=True,
+                    )
+                )
 
-            # Ouvrir un nouveau chandelier
             current_start = candle_start
             current_open = price
             current_high = price
@@ -159,165 +81,248 @@ def ticks_to_candles(ticks: list[dict], timeframe_seconds: int = 60) -> list[Can
             current_close = price
             volume = 1
         else:
-            # Meme chandelier: mise a jour
             current_high = max(current_high, price)
             current_low = min(current_low, price)
             current_close = price
             volume += 1
 
-    # Ne pas oublier le dernier chandelier
     if current_open is not None:
-        candles.append(Candle(
-            timestamp=current_start,
-            open=current_open,
-            high=current_high,
-            low=current_low,
-            close=current_close,
-            volume=volume,
-            symbol=ticks[-1].get("symbol", ""),
-            timeframe=f"M{timeframe_seconds // 60}",
-            is_closed=True,
-        ))
+        candles.append(
+            Candle(
+                timestamp=current_start,
+                open=current_open,
+                high=current_high,
+                low=current_low,
+                close=current_close,
+                volume=volume,
+                symbol=ticks[-1].get("symbol", ""),
+                timeframe=timeframe,
+                is_closed=True,
+            )
+        )
 
     return candles
 
 
-async def main():
+def _format_epoch(epoch: int) -> str:
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _print_coverage(coverage) -> None:
+    print(f"  Bougies attendues : {coverage.expected_candles:,}".replace(",", " "))
+    print(f"  Bougies chargees  : {coverage.candle_count:,}".replace(",", " "))
+    print(f"  Couverture span   : {coverage.span_coverage_pct:.2f}%")
+    print(f"  Densite bougies   : {coverage.density_pct:.2f}%")
+    if coverage.first_timestamp is not None and coverage.last_timestamp is not None:
+        print(f"  Premiere bougie   : {_format_epoch(coverage.first_timestamp)}")
+        print(f"  Derniere bougie   : {_format_epoch(coverage.last_timestamp)}")
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Backtest Deriv sur historique reel")
+    parser.add_argument("--symbol", default=None, help="Symbole Deriv, defaut: MARKET_SYMBOL")
+    parser.add_argument("--years", type=int, default=None, help="Nombre d'annees, defaut: BACKTEST_YEARS")
+    parser.add_argument("--timeframe", default=None, help="Timeframe, defaut: TIMEFRAME")
+    parser.add_argument("--refresh", action="store_true", help="Ignorer le cache SQLite existant")
+    parser.add_argument("--min-density-pct", type=float, default=90.0, help="Densite minimale exigee")
+    parser.add_argument("--min-span-pct", type=float, default=99.0, help="Couverture temporelle minimale exigee")
+    return parser.parse_args(argv)
+
+
+async def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     config = load_config()
     logger = setup_logger(config, "backtest_live")
 
-    # Parametres du backtest
-    SYMBOL = "1HZ100V"  # Volatility 100 Index (1s)
-    YEARS = 3
+    symbol = args.symbol or config.market_symbol
+    years = args.years if args.years is not None else config.backtest_years
+    timeframe = (args.timeframe or config.timeframe).upper()
+    timeframe_seconds = timeframe_to_seconds(timeframe)
+    timeframe = seconds_to_timeframe(timeframe_seconds)
+    window = build_historical_window(years, timeframe_seconds)
 
-    # Calcul des timestamps
-    end_epoch = int(_time.time())
-    start_epoch = end_epoch - YEARS * 365 * 24 * 3600
-
-    print("=" * 70)
-    print("  BACKTESTING PHASE 1 — 3 ANS D'HISTORIQUE REEL DERIV")
-    print("=" * 70)
-    print(f"  Symbole    : {SYMBOL} (Volatility 100 Index)")
-    print(f"  Periode    : {datetime.fromtimestamp(start_epoch).strftime('%Y-%m-%d')} -> "
-          f"{datetime.fromtimestamp(end_epoch).strftime('%Y-%m-%d')} ({YEARS} ans)")
-    print(f"  Timeframe  : M1")
+    print("=" * 76)
+    print("  BACKTESTING PHASE 1 - HISTORIQUE REEL DERIV")
+    print("=" * 76)
+    print(f"  Symbole    : {symbol}")
+    print(f"  Periode    : {_format_epoch(window.start_epoch)} -> {_format_epoch(window.end_epoch)}")
+    print(f"  Duree      : {years} ans calendaires")
+    print(f"  Timeframe  : {timeframe}")
     print(f"  Capital    : ${config.backtest_initial_capital:.2f}")
-    print(f"  Strategie  : Bollinger(20,2) + RSI(14) + Rejection Candles")
-    print(f"  Risk Mgt   : {config.risk_per_trade_pct}%/trade, {config.daily_stop_loss_pct}% daily SL")
+    print("  Source     : Deriv candles API + cache SQLite")
     print()
 
-    # 1. Connexion API Deriv
-    print("[1/4] Connexion a l'API Deriv...")
-    client = DerivClient(config, logger)
-    connected = await client.connect()
-    if not connected:
-        print("[FAIL] Impossible de se connecter a l'API Deriv")
-        return
-    print("[OK] Connecte au endpoint public\n")
+    storage = TickStorage(logger=logger)
+    candles: list[Candle] = []
 
-    # 2. Recuperation de l'historique
-    print("[2/4] Recuperation de l'historique des ticks...")
-    print(f"  Ceci peut prendre plusieurs minutes pour {YEARS} ans de donnees...")
-    t0 = _time.time()
-    ticks = await fetch_historical_ticks(client, SYMBOL, start_epoch, end_epoch, logger)
-    elapsed = _time.time() - t0
-    await client.disconnect()
+    try:
+        if not args.refresh:
+            candles = load_cached_candles(
+                storage,
+                symbol=symbol,
+                timeframe=timeframe,
+                start_epoch=window.start_epoch,
+                end_epoch=window.end_epoch,
+            )
 
-    if len(ticks) < 1000:
-        print(f"[FAIL] Seulement {len(ticks)} ticks recuperes — donnees insuffisantes")
-        print("  L'API peut limiter l'historique disponible.")
-        print("  Essayez avec un timeframe plus court (ex: 1 an).")
-        return
+        coverage = coverage_for_candles(
+            candles,
+            start_epoch=window.start_epoch,
+            end_epoch=window.end_epoch,
+            timeframe_seconds=timeframe_seconds,
+        )
 
-    print(f"[OK] {len(ticks)} ticks recuperes en {elapsed:.0f}s\n")
+        if candles:
+            print("[1/4] Cache SQLite detecte")
+            _print_coverage(coverage)
+            print()
+        else:
+            print("[1/4] Cache SQLite vide pour cette fenetre")
 
-    # 3. Construction des chandeliers M1
-    print("[3/4] Construction des chandeliers M1...")
-    candles = ticks_to_candles(ticks, timeframe_seconds=60)
-    print(f"[OK] {len(candles)} chandeliers M1 generes")
-    if candles:
-        print(f"  Premier: {datetime.fromtimestamp(candles[0].timestamp)} | "
-              f"O={candles[0].open:.2f} H={candles[0].high:.2f} "
-              f"L={candles[0].low:.2f} C={candles[0].close:.2f}")
-        print(f"  Dernier: {datetime.fromtimestamp(candles[-1].timestamp)} | "
-              f"O={candles[-1].open:.2f} H={candles[-1].high:.2f} "
-              f"L={candles[-1].low:.2f} C={candles[-1].close:.2f}")
-    print()
+        if not coverage.is_sufficient(
+            min_span_coverage_pct=args.min_span_pct,
+            min_density_pct=args.min_density_pct,
+        ):
+            fetch_end_epoch = window.end_epoch
+            if candles and coverage.last_gap_seconds is not None and coverage.last_gap_seconds <= 24 * 3600:
+                oldest_cached = min(int(c.timestamp) for c in candles)
+                if oldest_cached > window.start_epoch:
+                    fetch_end_epoch = oldest_cached - timeframe_seconds
+                    print(f"[2/4] Reprise du telechargement avant {_format_epoch(oldest_cached)}")
+                else:
+                    print("[2/4] Cache incomplet, retentative API sur toute la fenetre")
+            else:
+                print("[2/4] Telechargement de l'historique Deriv")
 
-    # 4. Backtesting
-    print("[4/4] Execution du backtesting...")
-    backtester = Backtester(config, logger)
-    t0 = _time.time()
-    result = backtester.run(candles)
-    elapsed = _time.time() - t0
+            client = DerivClient(config, logger)
+            connected = await client.connect()
+            if not connected:
+                print("[FAIL] Impossible de se connecter a l'API Deriv")
+                return 1
 
-    # Affichage des resultats
-    print()
-    print("=" * 70)
-    print("           RESULTATS DU BACKTEST — 3 ANS D'HISTORIQUE")
-    print("=" * 70)
-    d = result.to_dict()
-    labels = {
-        "total_trades": "Total trades",
-        "winning_trades": "Trades gagnants",
-        "losing_trades": "Trades perdants",
-        "win_rate": "Win rate (%)",
-        "initial_capital": "Capital initial ($)",
-        "final_capital": "Capital final ($)",
-        "total_return_pct": "Rendement total (%)",
-        "total_pnl": "P&L total ($)",
-        "max_drawdown_pct": "Drawdown max (%)",
-        "sharpe_ratio": "Sharpe ratio",
-        "sortino_ratio": "Sortino ratio",
-        "profit_factor": "Profit factor",
-        "avg_win": "Gain moyen ($)",
-        "avg_loss": "Perte moyenne ($)",
-        "expectancy": "Esperance ($)",
-        "largest_win": "Plus gros gain ($)",
-        "largest_loss": "Plus grosse perte ($)",
-    }
-    for key, label in labels.items():
-        value = d.get(key, "N/A")
-        print(f"  {label:<30s}: {value}")
+            t0 = _time.time()
+            try:
+                fetched = await fetch_historical_candles(
+                    client,
+                    symbol=symbol,
+                    start_epoch=window.start_epoch,
+                    end_epoch=fetch_end_epoch,
+                    timeframe_seconds=timeframe_seconds,
+                    timeframe=timeframe,
+                    logger=logger,
+                    storage=storage,
+                )
+            finally:
+                await client.disconnect()
 
-    print(f"\n  Duree backtest         : {elapsed:.1f}s")
-    print(f"  Bougies traitees       : {len(candles)}")
-    print("=" * 70)
+            elapsed = _time.time() - t0
+            print(f"  Bougies recuperees API : {len(fetched):,} en {elapsed:.0f}s".replace(",", " "))
 
-    # Interpretation
-    print("\n--- INTERPRETATION (Plan 1, Section 5.1) ---")
-    if result.total_trades < 30:
-        print("⚠ Trop peu de trades (< 30) — evaluation statistique peu fiable.")
-    elif result.profit_factor > 1.5 and result.sharpe_ratio > 1.0 and result.max_drawdown_pct < 20:
-        print("✅ La strategie satisfait les criteres du Plan 1:")
-        print(f"   - Profit factor > 1.5: {result.profit_factor:.2f}")
-        print(f"   - Sharpe ratio > 1.0:  {result.sharpe_ratio:.2f}")
-        print(f"   - Drawdown < 20%:      {result.max_drawdown_pct:.2f}%")
-        print("   → Eligible pour la Phase 2 (Paper Trading)")
-    else:
-        print("⚠ La strategie necessite des ajustements avant la Phase 2.")
-        print(f"   Profit factor: {result.profit_factor:.2f} (cible > 1.5)")
-        print(f"   Sharpe ratio:  {result.sharpe_ratio:.2f} (cible > 1.0)")
-        print(f"   Drawdown max:  {result.max_drawdown_pct:.2f}% (cible < 20%)")
+            candles = load_cached_candles(
+                storage,
+                symbol=symbol,
+                timeframe=timeframe,
+                start_epoch=window.start_epoch,
+                end_epoch=window.end_epoch,
+            )
+            coverage = coverage_for_candles(
+                candles,
+                start_epoch=window.start_epoch,
+                end_epoch=window.end_epoch,
+                timeframe_seconds=timeframe_seconds,
+            )
+            print()
+        else:
+            print("[2/4] Cache suffisant, pas d'appel API necessaire")
+            print()
 
-    # Sauvegarder les resultats
-    output_file = Path(config.base_dir) / "backtest_3ans_results.json"
-    with open(output_file, "w") as f:
-        json.dump({
-            "metadata": {
-                "symbol": SYMBOL,
-                "years": YEARS,
-                "start_date": datetime.fromtimestamp(start_epoch).isoformat(),
-                "end_date": datetime.fromtimestamp(end_epoch).isoformat(),
-                "total_candles": len(candles),
-                "total_ticks": len(ticks),
-                "strategy": "Bollinger(20,2) + RSI(14) + Rejection Candles",
-            },
-            "results": d,
-            "trades": result.trade_list[:50],  # 50 premiers trades
-        }, f, indent=2)
-    print(f"\nResultats sauvegardes dans: {output_file}")
+        candles = deduplicate_candles(candles)
+
+        print("[3/4] Validation couverture 3 ans")
+        _print_coverage(coverage)
+        if not coverage.is_sufficient(
+            min_span_coverage_pct=args.min_span_pct,
+            min_density_pct=args.min_density_pct,
+        ):
+            print("[FAIL] Historique insuffisant pour un vrai backtest 3 ans.")
+            print("       Le backtest est volontairement bloque pour eviter un resultat trompeur.")
+            return 2
+        print("[OK] Couverture historique validee")
+        print()
+
+        print("[4/4] Execution du backtesting")
+        backtester = Backtester(config, logger)
+        t0 = _time.time()
+        result = backtester.run(candles)
+        elapsed = _time.time() - t0
+
+        print()
+        print("=" * 76)
+        print("           RESULTATS DU BACKTEST - HISTORIQUE REEL")
+        print("=" * 76)
+        d = result.to_dict()
+        labels = {
+            "total_trades": "Total trades",
+            "winning_trades": "Trades gagnants",
+            "losing_trades": "Trades perdants",
+            "win_rate": "Win rate (%)",
+            "initial_capital": "Capital initial ($)",
+            "final_capital": "Capital final ($)",
+            "total_return_pct": "Rendement total (%)",
+            "total_pnl": "P&L total ($)",
+            "max_drawdown_pct": "Drawdown max (%)",
+            "sharpe_ratio": "Sharpe ratio",
+            "sortino_ratio": "Sortino ratio",
+            "profit_factor": "Profit factor",
+            "avg_win": "Gain moyen ($)",
+            "avg_loss": "Perte moyenne ($)",
+            "expectancy": "Esperance ($)",
+            "largest_win": "Plus gros gain ($)",
+            "largest_loss": "Plus grosse perte ($)",
+        }
+        for key, label in labels.items():
+            print(f"  {label:<30s}: {d.get(key, 'N/A')}")
+        print(f"\n  Duree backtest         : {elapsed:.1f}s")
+        print(f"  Bougies traitees       : {len(candles):,}".replace(",", " "))
+        print("=" * 76)
+
+        print("\n--- INTERPRETATION ---")
+        if result.total_trades < 30:
+            print("Trop peu de trades (< 30) : evaluation statistique peu fiable.")
+        elif result.profit_factor > 1.5 and result.sharpe_ratio > 1.0 and result.max_drawdown_pct < 20:
+            print("La strategie satisfait les criteres de passage en Phase 2.")
+        else:
+            print("La strategie necessite des ajustements avant la Phase 2.")
+            print(f"Profit factor: {result.profit_factor:.2f} (cible > 1.5)")
+            print(f"Sharpe ratio : {result.sharpe_ratio:.2f} (cible > 1.0)")
+            print(f"Drawdown max : {result.max_drawdown_pct:.2f}% (cible < 20%)")
+
+        output_file = Path(config.base_dir) / "backtest_3ans_results.json"
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "metadata": {
+                        "symbol": symbol,
+                        "years": years,
+                        "timeframe": timeframe,
+                        "start_date": window.start_datetime.isoformat(),
+                        "end_date": window.end_datetime.isoformat(),
+                        "total_candles": len(candles),
+                        "source": "Deriv candles API + SQLite cache",
+                        "strategy": "Bollinger(20,2) + RSI(14) + Rejection Candles",
+                        "coverage": coverage.to_dict(),
+                    },
+                    "results": d,
+                    "trades": result.trade_list[:50],
+                },
+                f,
+                indent=2,
+            )
+        print(f"\nResultats sauvegardes dans: {output_file}")
+        return 0
+    finally:
+        storage.close()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(asyncio.run(main()))

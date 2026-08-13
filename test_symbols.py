@@ -25,7 +25,7 @@ SYMBOLS_TO_TEST = [
 ]
 
 
-async def test_symbol(client, symbol, logger):
+async def check_symbol(client, symbol, logger):
     """Teste un symbole."""
     sub = await client.subscribe_ticks(symbol)
     if sub is None:
@@ -65,7 +65,7 @@ async def main():
     invalid_symbols = []
 
     for symbol in SYMBOLS_TO_TEST:
-        status, detail = await test_symbol(client, symbol, logger)
+        status, detail = await check_symbol(client, symbol, logger)
         if status is True:
             print(f"  [VALID]   {symbol:20s} -> {detail}")
             valid_symbols.append(symbol)
