@@ -411,6 +411,20 @@ class TestStrategyEngine:
         signal = strategy_engine.evaluate()
         assert signal.direction in (SignalDirection.CALL, SignalDirection.PUT, SignalDirection.HOLD)
 
+    def test_volatility_filter_rejects_zero_atr(self, strategy_engine):
+        signal = strategy_engine._detect_signal(
+            open_price=90.0,
+            high=100.0,
+            low=80.0,
+            close_price=90.0,
+            bb_upper=110.0,
+            bb_middle=100.0,
+            bb_lower=95.0,
+            rsi_value=20.0,
+            atr_value=0.0,
+        )
+        assert signal.direction == SignalDirection.HOLD
+
     def test_signal_has_all_fields(self, strategy_engine, candle_builder):
         """Verifie que le signal retourne a tous les champs remplis."""
         np.random.seed(42)
@@ -481,10 +495,17 @@ class TestRiskManager:
         assert report.position_size > 0
 
     def test_position_size_calculation(self, risk_manager):
-        expected = risk_manager.current_capital * 0.02  # 2%
+        raw = risk_manager.current_capital * 0.02  # 2%
+        max_stake = getattr(risk_manager.config, 'max_stake_usd', 0)
+        expected = min(raw, max_stake) if max_stake > 0 else raw
         assert risk_manager._calculate_position_size() == round(expected, 2)
 
     def test_max_trades_per_day(self, risk_manager):
+        risk_manager = RiskManager(Config(
+            initial_capital=100.0,
+            max_trades_per_day=2,
+            daily_profit_target_pct=99.0,
+        ))
         signal = TradingSignal(
             direction=SignalDirection.CALL, symbol="R_75", confidence=0.8, score=80.0
         )
@@ -690,7 +711,8 @@ class TestOrderExecutor:
         # Le prix monte au-dessus du TP
         closed = await order_executor.simulate_price_movement(order, 106.0)
         assert closed is not None
-        assert closed.pnl == 10.0 * 5.0  # Risk:Reward 1:5
+        expected_rr = abs(order.take_profit - order.entry_price) / abs(order.entry_price - order.stop_loss)
+        assert closed.pnl == pytest.approx(10.0 * expected_rr)
         assert len(order_executor.active_orders) == 0
 
     @pytest.mark.asyncio
@@ -725,7 +747,8 @@ class TestOrderExecutor:
 
         closed = await order_executor.simulate_price_movement(order, 94.0)
         assert closed is not None
-        assert closed.pnl == 10.0 * 5.0
+        expected_rr = abs(order.take_profit - order.entry_price) / abs(order.entry_price - order.stop_loss)
+        assert closed.pnl == pytest.approx(10.0 * expected_rr)
 
     @pytest.mark.asyncio
     async def test_price_within_range_no_close(self, order_executor):

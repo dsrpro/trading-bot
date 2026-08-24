@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.config import Config
 from src.telegram_manager import TelegramManager
+from paper_trading_live import PaperTradingLive
 
 
 def _config_with_telegram() -> Config:
@@ -138,6 +139,74 @@ class TestTelegramHandleUpdates:
         ]
         await mgr._handle_updates(updates)
         assert replies == ["ETAT_OK"]
+
+    @pytest.mark.asyncio
+    async def test_command_without_leading_slash_is_accepted(self):
+        mgr = TelegramManager(_config_with_telegram())
+        replies = []
+
+        async def fake_send(text: str) -> bool:
+            replies.append(text)
+            return True
+
+        mgr.send_message = fake_send
+        mgr.register_command("/run", lambda text: f"RUN:{text}")
+
+        updates = [
+            {
+                "update_id": 30,
+                "message": {
+                    "chat": {"id": "987654321"},
+                    "text": "Run 6, 9,7,8,11,17",
+                },
+            },
+        ]
+        await mgr._handle_updates(updates)
+        assert replies == ["RUN:Run 6, 9,7,8,11,17"]
+
+    @pytest.mark.asyncio
+    async def test_stale_telegram_messages_are_ignored_on_startup(self):
+        mgr = TelegramManager(_config_with_telegram())
+        replies = []
+
+        async def fake_send(text: str) -> bool:
+            replies.append(text)
+            return True
+
+        mgr.send_message = fake_send
+        mgr.register_command("/stop", lambda: "STOPPED")
+
+        old_ts = 1700000000
+        updates = [
+            {
+                "update_id": 50,
+                "message": {
+                    "chat": {"id": "987654321"},
+                    "date": old_ts,
+                    "text": "/stop",
+                },
+            },
+        ]
+
+        await mgr._handle_updates(updates)
+        assert replies == []
+
+
+class TestBotPauseResume:
+    def test_stop_then_resume_keeps_process_running(self):
+        cfg = Config(telegram_bot_token="123456:TESTTOKEN", telegram_chat_id="987654321")
+        engine = PaperTradingLive(cfg, "STPRNG")
+
+        assert engine._running is False
+        assert engine._paused is False
+
+        engine._tg_stop()
+        assert engine._running is True
+        assert engine._paused is True
+
+        engine._tg_resume()
+        assert engine._running is True
+        assert engine._paused is False
 
 
 class TestTelegramSendMessage:

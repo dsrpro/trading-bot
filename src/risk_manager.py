@@ -157,36 +157,32 @@ class RiskManager:
             self.logger.warning(f"Trade bloque: KILL SWITCH - {self._blocked_reason}")
             return False, report
 
-        # 2. Nombre maximum de trades par jour
-        if self._trades_today >= self.config.max_trades_per_day:
-            report.status = RiskStatus.MAX_TRADES_REACHED
-            report.can_trade = False
-            report.reason_blocked = f"Max {self.config.max_trades_per_day} trades/jour atteint"
-            self.logger.info(f"Trade bloque: {report.reason_blocked}")
-            return False, report
-
-        # 3. Stop-loss quotidien (5%)
-        daily_loss_pct = abs(min(self._daily_pnl, 0)) / self._daily_start_capital * 100.0 if self._daily_start_capital > 0 else 0.0
-        if daily_loss_pct >= self.config.daily_stop_loss_pct:
+        # 2. Stop-loss quotidien (en % et en USD)
+        daily_loss = abs(min(self._daily_pnl, 0))
+        daily_loss_pct = (daily_loss / self._daily_start_capital * 100.0) if self._daily_start_capital > 0 else 0.0
+        stop_loss_usd_reached = getattr(self.config, 'daily_stop_loss_usd', 0) > 0 and daily_loss >= self.config.daily_stop_loss_usd
+        if daily_loss_pct >= self.config.daily_stop_loss_pct or stop_loss_usd_reached:
             report.status = RiskStatus.DAILY_LOSS_LIMIT_REACHED
             report.can_trade = False
-            report.reason_blocked = f"Perte quotidienne {daily_loss_pct:.2f}% >= {self.config.daily_stop_loss_pct}%"
+            report.reason_blocked = f"Perte quotidienne (PnL=${self._daily_pnl:.2f}, {daily_loss_pct:.2f}%) atteinte"
             self.logger.warning(f"Trade bloque: {report.reason_blocked}")
             self._kill_switch = True
             self._blocked_reason = report.reason_blocked
             return False, report
 
-        # 4. Objectif de profit quotidien (4%)
+        # 3. Objectif de profit quotidien (en % et en USD)
         if self._daily_pnl > 0:
-            daily_profit_pct = self._daily_pnl / self._daily_start_capital * 100.0
-            if daily_profit_pct >= self.config.daily_profit_target_pct:
+            daily_profit_pct = (self._daily_pnl / self._daily_start_capital * 100.0)
+            profit_usd_target = getattr(self.config, 'daily_profit_target_usd', 0.0)
+            profit_usd_reached = profit_usd_target > 0 and self._daily_pnl >= profit_usd_target
+            if daily_profit_pct >= self.config.daily_profit_target_pct or profit_usd_reached:
                 report.status = RiskStatus.DAILY_PROFIT_TARGET_REACHED
                 report.can_trade = False
-                report.reason_blocked = f"Objectif quotidien {daily_profit_pct:.2f}% atteint"
+                report.reason_blocked = f"Objectif quotidien de profit (${self._daily_pnl:.2f}) atteint"
                 self.logger.info(f"Trade bloque: {report.reason_blocked}")
                 return False, report
 
-        # 5. Drawdown maximum (20%)
+        # 4. Drawdown maximum (20%)
         drawdown = self._calculate_drawdown_pct()
         if drawdown >= self.config.max_drawdown_pct:
             report.status = RiskStatus.MAX_DRAWDOWN_REACHED
@@ -195,6 +191,14 @@ class RiskManager:
             self.logger.warning(f"Trade bloque: {report.reason_blocked}")
             self._kill_switch = True
             self._blocked_reason = report.reason_blocked
+            return False, report
+
+        # 5. Nombre maximum de trades par jour
+        if self._trades_today >= self.config.max_trades_per_day:
+            report.status = RiskStatus.MAX_TRADES_REACHED
+            report.can_trade = False
+            report.reason_blocked = f"Max {self.config.max_trades_per_day} trades/jour atteint"
+            self.logger.info(f"Trade bloque: {report.reason_blocked}")
             return False, report
 
         # 6. Verification du signal
@@ -304,15 +308,35 @@ class RiskManager:
         self._reset_daily_if_needed()
         daily_pnl_pct = (self._daily_pnl / self._daily_start_capital * 100.0) if self._daily_start_capital > 0 else 0.0
 
+        daily_loss = abs(min(self._daily_pnl, 0))
+        stop_loss_usd_reached = getattr(self.config, 'daily_stop_loss_usd', 0) > 0 and daily_loss >= self.config.daily_stop_loss_usd
+        profit_usd_target = getattr(self.config, 'daily_profit_target_usd', 0.0)
+        profit_usd_reached = profit_usd_target > 0 and self._daily_pnl >= profit_usd_target
+
+        is_daily_stop_hit = (
+            (daily_pnl_pct <= -self.config.daily_stop_loss_pct)
+            or stop_loss_usd_reached
+        )
+        is_daily_profit_hit = (
+            (self._daily_pnl > 0 and daily_pnl_pct >= self.config.daily_profit_target_pct)
+            or profit_usd_reached
+        )
+
         can_trade = (
             not self._kill_switch
             and self._trades_today < self.config.max_trades_per_day
             and self._calculate_drawdown_pct() < self.config.max_drawdown_pct
+            and not is_daily_profit_hit
+            and not is_daily_stop_hit
         )
 
         if not can_trade:
             if self._kill_switch:
                 status = RiskStatus.KILL_SWITCH_ACTIVATED
+            elif is_daily_profit_hit:
+                status = RiskStatus.DAILY_PROFIT_TARGET_REACHED
+            elif is_daily_stop_hit:
+                status = RiskStatus.DAILY_LOSS_LIMIT_REACHED
             elif self._trades_today >= self.config.max_trades_per_day:
                 status = RiskStatus.MAX_TRADES_REACHED
             else:
@@ -338,13 +362,16 @@ class RiskManager:
         )
 
     def _calculate_position_size(self) -> float:
-        """Calcule la taille de position basee sur le risque par trade (2%).
+        """Calcule la taille de position basee sur le risque par trade (2%), capee a max_stake_usd.
 
         Returns:
             Montant du stake en USD.
         """
         risk_amount = self.current_capital * (self.config.risk_per_trade_pct / 100.0)
-        return round(risk_amount, 2)
+        max_stake = getattr(self.config, 'max_stake_usd', 25.0)
+        if max_stake > 0:
+            risk_amount = min(risk_amount, max_stake)
+        return round(max(risk_amount, float(self.config.min_stake)), 2)
 
     def _calculate_drawdown_pct(self) -> float:
         """Calcule le drawdown actuel en pourcentage.

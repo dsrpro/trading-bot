@@ -114,20 +114,21 @@ class StrategyEngine:
 
         # Dernier signal pour eviter les doublons
         self._last_signal_time: float = 0.0
-        self._signal_cooldown_candles: int = 2
+        self._last_signal_candle_count: int = -10_000
+        self._signal_cooldown_candles: int = getattr(config, 'signal_cooldown_candles', 1)
 
-        # Parametres optimises Phase 2
+        # Parametres optimises Scalping / Phase 2
         self.use_trend_filter: bool = True
         self.ema_fast_period: int = 50
         self.ema_slow_period: int = 200
-        self.rsi_oversold_tight: float = 25.0
-        self.rsi_overbought_tight: float = 75.0
+        self.rsi_oversold_tight: float = getattr(config, 'rsi_oversold', 25.0)
+        self.rsi_overbought_tight: float = getattr(config, 'rsi_overbought', 75.0)
         self.use_atr_trailing_stop: bool = True
         self.use_volatility_filter: bool = True
-        self.atr_sl_multiplier: float = 1.5   # SL = 1.5x ATR
-        self.atr_tp_multiplier: float = 3.0   # TP = 3.0x ATR (R:R ~1:2)
-        self.min_atr_pct: float = 0.0003      # Filtre volatilité min 0.03%
-        self.max_atr_pct: float = 0.008       # Filtre volatilité max 0.8%
+        self.atr_sl_multiplier: float = getattr(config, 'atr_sl_multiplier', 1.0)
+        self.atr_tp_multiplier: float = getattr(config, 'atr_tp_multiplier', 1.5)
+        self.min_atr_pct: float = 0.0003      # Filtre volatilite min 0.03%
+        self.max_atr_pct: float = 0.008       # Filtre volatilite max 0.8%
         self.trend_strength_min: float = 0.15  # Force de tendance minimum (%)
 
     def evaluate(self, current_candle: Optional[Candle] = None) -> TradingSignal:
@@ -139,10 +140,12 @@ class StrategyEngine:
         Returns:
             Un TradingSignal (direction HOLD si aucun signal).
         """
-        candles = self.candle_builder.get_recent_candles(50)
-        if len(candles) < self.config.bb_period + 2:
+        lookback = max(50, self.ema_slow_period + 5)
+        candles = self.candle_builder.get_recent_candles(lookback)
+        bb_period = getattr(self.config, 'bb_period', 20)
+        if len(candles) < bb_period + 2:
             self.logger.debug(
-                f"Bougies insuffisantes: {len(candles)} < {self.config.bb_period + 2}"
+                f"Bougies insuffisantes: {len(candles)} < {bb_period + 2}"
             )
             return self._empty_signal()
 
@@ -160,8 +163,15 @@ class StrategyEngine:
             opens = np.append(opens, current_candle.open)
 
         # Calcul des indicateurs
-        upper, middle, lower = self.indicators.bollinger_bands(closes)
-        rsi_values = self.indicators.rsi(closes)
+        upper, middle, lower = self.indicators.bollinger_bands(
+            closes,
+            period=getattr(self.config, 'bb_period', 20),
+            nbdev=getattr(self.config, 'bb_stddev', 2.0),
+        )
+        rsi_values = self.indicators.rsi(
+            closes,
+            period=getattr(self.config, 'rsi_period', 14),
+        )
         atr_values = self.indicators.atr(highs, lows, closes)
 
         if upper is None or rsi_values is None:
@@ -187,6 +197,16 @@ class StrategyEngine:
 
         # Remplir les donnees du signal
         if signal.direction != SignalDirection.HOLD:
+            candle_count = self.candle_builder.count()
+            candles_since_last = candle_count - self._last_signal_candle_count
+            if candles_since_last < self._signal_cooldown_candles:
+                self.logger.debug(
+                    f"Signal rejete: cooldown actif "
+                    f"({candles_since_last}/{self._signal_cooldown_candles} bougies)"
+                )
+                return self._empty_signal()
+            self._last_signal_candle_count = candle_count
+
             signal.entry_price = last_close
             signal.bb_upper = last_upper
             signal.bb_middle = last_middle
@@ -202,8 +222,6 @@ class StrategyEngine:
             )
 
             # Calcul des niveaux de SL/TP base sur l'ATR (volatilite reelle).
-            # Utilise les multiplicateurs ATR definis en tete de classe :
-            #   SL = 1.5x ATR, TP = 3.0x ATR (R:R ~1:2).
             if last_atr > 0:
                 if signal.direction == SignalDirection.CALL:
                     signal.stop_loss = last_close - self.atr_sl_multiplier * last_atr
@@ -212,13 +230,13 @@ class StrategyEngine:
                     signal.stop_loss = last_close + self.atr_sl_multiplier * last_atr
                     signal.take_profit = last_close - self.atr_tp_multiplier * last_atr
             else:
-                # Fallback si ATR indisponible : 1% / 5% autour du prix d'entree
+                # Fallback si ATR indisponible
                 if signal.direction == SignalDirection.CALL:
                     signal.stop_loss = last_close * 0.99
-                    signal.take_profit = last_close * 1.05
+                    signal.take_profit = last_close * 1.015
                 else:
                     signal.stop_loss = last_close * 1.01
-                    signal.take_profit = last_close * 0.95
+                    signal.take_profit = last_close * 0.985
 
             self.logger.info(
                 f"SIGNAL {signal.direction.value} | "
@@ -286,6 +304,31 @@ class StrategyEngine:
         uptrend, downtrend, trend_ratio = True, True, 0.0
         if self.use_trend_filter and len(closes_all) >= self.ema_slow_period + 5:
             uptrend, downtrend, trend_ratio = self._check_trend_filter(closes_all)
+            if abs(trend_ratio) < self.trend_strength_min:
+                self.logger.debug(
+                    f"Signal rejete: tendance trop faible "
+                    f"(ratio={trend_ratio:.2f}%, min={self.trend_strength_min:.2f}%)"
+                )
+                return self._empty_signal()
+
+        # Filtre de volatilite ATR: evite les ranges trop calmes et les pics trop violents.
+        if self.use_volatility_filter:
+            if atr_value <= 0 or close_price <= 0:
+                self.logger.debug("Signal rejete: ATR ou prix invalide")
+                return self._empty_signal()
+            atr_pct = atr_value / close_price
+            if atr_pct < self.min_atr_pct:
+                self.logger.debug(
+                    f"Signal rejete: volatilite trop faible "
+                    f"(ATR={atr_pct:.4%}, min={self.min_atr_pct:.4%})"
+                )
+                return self._empty_signal()
+            if atr_pct > self.max_atr_pct:
+                self.logger.debug(
+                    f"Signal rejete: volatilite trop elevee "
+                    f"(ATR={atr_pct:.4%}, max={self.max_atr_pct:.4%})"
+                )
+                return self._empty_signal()
 
         # --- CALL Signal ---
         call_conditions = 0
@@ -390,3 +433,4 @@ class StrategyEngine:
     def reset(self) -> None:
         """Reinitialise le moteur de strategie."""
         self._last_signal_time = 0.0
+        self._last_signal_candle_count = -10_000

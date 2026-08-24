@@ -14,7 +14,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Optional
+from typing import Optional, Any
 
 from src.config import Config
 from src.deriv_client import DerivClient
@@ -93,14 +93,19 @@ class OrderExecutor:
         config: Config,
         deriv_client: Optional[DerivClient] = None,
         logger: Optional[logging.Logger] = None,
+        telegram_manager: Optional[Any] = None,
     ):
         self.config = config
         self.deriv_client = deriv_client
         self.logger = logger or logging.getLogger("order_executor")
+        # Telegram manager (optionnel) — utilisé pour notifier les rejets/min_stake
+        self.telegram = telegram_manager
 
         self._active_orders: dict[str, Order] = {}
         self._order_history: list[Order] = []
         self._simulation_latency_ms: float = 100.0  # Latence simulee
+        # Compteur de rejets due a min_stake
+        self.min_stake_rejections: int = 0
 
     @property
     def active_orders(self) -> list[Order]:
@@ -120,6 +125,29 @@ class OrderExecutor:
         Returns:
             Order cree ou None si l'execution echoue.
         """
+        # Enforce minimum stake to avoid sending proposals below broker limits
+        if amount < float(self.config.min_stake):
+            # Incremente le compteur
+            try:
+                self.min_stake_rejections += 1
+            except Exception:
+                pass
+
+            # Message professionnel et actionnable
+            msg = (
+                f"Ordre refuse — montant ${amount:.2f} inférieur au minimum configuré ${self.config.min_stake:.2f}. "
+                "Ajustez `MIN_STAKE` ou augmentez `RISK_PER_TRADE_PCT`."
+            )
+            self.logger.warning(msg)
+            # Tenter d'envoyer une notification Telegram si disponible
+            try:
+                if getattr(self, 'telegram', None) and getattr(self.telegram, 'enabled', False):
+                    loop = asyncio.get_event_loop()
+                    # send_message est async; on crée une tâche pour ne pas bloquer
+                    loop.create_task(self.telegram.send_message(f"⚠️ {msg}"))
+            except Exception:
+                self.logger.exception("Impossible d'envoyer la notification Telegram pour min_stake")
+            return None
         if self.config.mode == "dry_run":
             return await self._execute_dry_run(signal, amount)
         elif self.config.mode == "paper_trading":
@@ -150,7 +178,7 @@ class OrderExecutor:
                 self._archive_order(order)
                 return order
             if current_price >= order.take_profit:
-                pnl = order.amount * self.config.risk_reward_ratio  # R:R 1:5
+                pnl = order.amount * self._reward_multiple(order)
                 order.close(current_price, pnl)
                 self.logger.info(f"TP touche CALL | Exit={current_price:.5f} TP={order.take_profit:.5f} PnL=${pnl:.2f}")
                 self._archive_order(order)
@@ -164,13 +192,21 @@ class OrderExecutor:
                 self._archive_order(order)
                 return order
             if current_price <= order.take_profit:
-                pnl = order.amount * self.config.risk_reward_ratio
+                pnl = order.amount * self._reward_multiple(order)
                 order.close(current_price, pnl)
                 self.logger.info(f"TP touche PUT | Exit={current_price:.5f} TP={order.take_profit:.5f} PnL=${pnl:.2f}")
                 self._archive_order(order)
                 return order
 
         return None  # Toujours ouvert
+
+    def _reward_multiple(self, order: Order) -> float:
+        """Retourne le multiple de gain implique par les distances SL/TP."""
+        risk_distance = abs(order.entry_price - order.stop_loss)
+        reward_distance = abs(order.take_profit - order.entry_price)
+        if risk_distance > 0 and reward_distance > 0:
+            return reward_distance / risk_distance
+        return self.config.risk_reward_ratio
 
     def close_all_orders(self, current_price: float) -> list[Order]:
         """Ferme tous les ordres actifs au prix du marche.

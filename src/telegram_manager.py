@@ -16,10 +16,13 @@ Configuration requise dans settings.env :
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import ssl
+import time
 from typing import Callable, Optional
+import os
 from urllib.request import Request, urlopen
 
 from src.config import Config
@@ -34,11 +37,14 @@ class TelegramManager:
     COMMAND_DESCRIPTIONS = {
         "/help": "Liste des commandes",
         "/start": "Demarrer le bot",
+        "/run": "Demarrer sur un ou plusieurs symboles",
+        "/markets": "Lister les marchés disponibles",
         "/status": "Etat actuel du bot",
         "/report": "Rapport de risque",
         "/kill": "Arret d'urgence (kill switch)",
         "/resume": "Desactive le kill switch",
         "/stop": "Arret propre du bot",
+        "/choose": "Selectionner par index",
     }
 
     def __init__(
@@ -52,11 +58,19 @@ class TelegramManager:
         self.token = config.telegram_bot_token
         self.chat_id = chat_id or config.telegram_chat_id
 
-        self._enabled = bool(self.token and self.chat_id)
+        # Respecter la variable d'environnement TELEGRAM_DISABLE
+        if os.environ.get("TELEGRAM_DISABLE") == "1":
+            self._enabled = False
+        else:
+            self._enabled = bool(self.token and self.chat_id)
         self._offset: Optional[int] = None
         self._running = False
         self._poll_task: Optional[asyncio.Task] = None
         self._command_handlers: dict[str, Callable] = {}
+        self._startup_ts = int(time.time())
+        # Count consecutive 409 Conflict responses from getUpdates
+        self._conflict_count: int = 0
+        self._poll_error_count: int = 0
 
     @property
     def enabled(self) -> bool:
@@ -91,6 +105,11 @@ class TelegramManager:
             return False
 
         loop = asyncio.get_event_loop()
+        # Log the payload we will send so we can debug live discrepancies
+        try:
+            self.logger.debug(f"setMyCommands payload: {json.dumps({'commands': commands})}")
+        except Exception:
+            pass
         result = await loop.run_in_executor(
             None,
             self._call_sync,
@@ -108,6 +127,11 @@ class TelegramManager:
                 f"Enregistrement des commandes Telegram echoue: "
                 f"{json.dumps(result)[:200] if result else 'aucune reponse'}"
             )
+            # If there is a detailed body, log it at debug for troubleshooting
+            try:
+                self.logger.debug(f"setMyCommands response full: {json.dumps(result, ensure_ascii=False)}")
+            except Exception:
+                pass
         return ok
 
     # ── Appels HTTP (bloquants, executes dans un thread) ─────────────
@@ -123,9 +147,30 @@ class TelegramManager:
         )
         try:
             ctx = ssl.create_default_context()
-            with urlopen(req, context=ctx, timeout=30) as resp:
+            timeout = max(1.0, float(getattr(self.config, "telegram_request_timeout", 10.0)))
+            with urlopen(req, context=ctx, timeout=timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except Exception as e:
+            # Try to capture HTTPError body if available and return parsed JSON
+            try:
+                body_reader = getattr(e, 'read', None)
+                if callable(body_reader):
+                    raw = e.read()
+                    try:
+                        text = raw.decode('utf-8')
+                    except Exception:
+                        text = str(raw)
+                    try:
+                        parsed = json.loads(text)
+                        # Log and return the parsed error JSON for callers to react
+                        self.logger.error(f"Telegram {method} HTTP error parsed: {parsed}")
+                        return parsed
+                    except Exception:
+                        self.logger.error(f"Telegram {method} error: {e} -- body: {text}")
+                        return None
+            except Exception:
+                pass
+
             self.logger.error(f"Telegram {method} error: {e}")
             return None
 
@@ -152,13 +197,54 @@ class TelegramManager:
     # ── Polling des commandes ────────────────────────────────────────
 
     async def _poll_once(self) -> list[dict]:
-        params: dict = {"timeout": 1, "allowed_updates": json.dumps(["message"])}
+        params: dict = {"timeout": 1, "allowed_updates": json.dumps(["message"]) }
         if self._offset is not None:
             params["offset"] = self._offset
 
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, self._call_sync, "getUpdates", params)
+
+        # Handle Telegram HTTP-level errors returned as parsed JSON (e.g. 409 Conflict)
+        if result and not result.get("ok") and result.get("error_code") == 409:
+            # Consecutive conflict counter
+            self._conflict_count += 1
+            self._poll_error_count = 0
+            max_backoff = getattr(self.config, 'telegram_backoff_max', 60)
+            backoff = min(max_backoff, 2 ** self._conflict_count)
+            self.logger.warning(
+                f"Telegram getUpdates conflict (409) #{self._conflict_count}: {result.get('description')}; backoff={backoff}s"
+            )
+            # After N consecutive conflicts, alert via Telegram and stop polling to avoid spam
+            threshold = getattr(self.config, 'telegram_conflict_threshold', 3)
+            if self._conflict_count >= threshold:
+                try:
+                    await self.send_message(
+                        "⚠️ Polling interrompu: plusieurs erreurs 409 (conflict). "
+                        "Assurez-vous qu'aucune autre instance ne sonde ce bot (getUpdates) et relancez."
+                    )
+                except Exception:
+                    self.logger.exception("Impossible d'envoyer l'alerte Telegram sur conflit 409")
+                # Stop polling to avoid repeated noise
+                self._running = False
+                return []
+
+            await asyncio.sleep(backoff)
+            return []
+
+        # Reset conflict counter on successful non-409 response
+        if result and result.get("ok"):
+            self._conflict_count = 0
+            self._poll_error_count = 0
+
         if not result or not result.get("ok"):
+            self._poll_error_count += 1
+            max_backoff = getattr(self.config, 'telegram_backoff_max', 60)
+            backoff = min(max_backoff, 2 ** min(self._poll_error_count, 6))
+            self.logger.warning(
+                f"Telegram getUpdates indisponible "
+                f"(erreur reseau #{self._poll_error_count}); retry dans {backoff}s"
+            )
+            await asyncio.sleep(backoff)
             return []
 
         updates = result.get("result", [])
@@ -204,24 +290,70 @@ class TelegramManager:
                 continue
 
             text = (message.get("text") or "").strip()
-            if not text.startswith("/"):
+            if not text:
                 continue
+
+            # Ignore les messages Telegram déjà en file avant le démarrage
+            # actuel du bot (ex. anciens /stop, /resume ou /run traités lors
+            # d'un précédent lancement et encore présents dans la file).
+            msg_date = message.get("date")
+            if isinstance(msg_date, (int, float)) and int(msg_date) < self._startup_ts:
+                self.logger.debug(
+                    "Ignorer message Telegram stale: date=%s startup=%s text=%s",
+                    msg_date,
+                    self._startup_ts,
+                    text,
+                )
+                continue
+
+            first_token = text.split()[0].split("@")[0].lower()
+            command = first_token if first_token.startswith("/") else f"/{first_token}"
+
+            # Accepter les commandes avec ou sans slash, par exemple
+            # "/run 1,2,3" ou "Run 1,2,3". Les messages ordinaires ne
+            # sont pas traites, sauf si leur premier mot correspond a une
+            # commande connue.
+            if not first_token.startswith("/"):
+                match = False
+                for registered in self._command_handlers:
+                    if registered.lower().lstrip("/") == first_token:
+                        match = True
+                        command = registered.lower()
+                        break
+                if not match:
+                    continue
 
             # Securite : ne repondre qu'au chat autorise
             chat = message.get("chat", {}) if isinstance(message.get("chat"), dict) else {}
-            if str(chat.get("id", "")) != str(self.chat_id):
+            incoming_chat = str(chat.get("id", ""))
+            if incoming_chat != str(self.chat_id):
+                self.logger.debug(f"Ignorer message d'un chat non autorise: chat_id={incoming_chat} attendu={self.chat_id} text={text}")
                 continue
 
-            command = text.split()[0].split("@")[0].lower()
             handler = self._command_handlers.get(command)
             if handler is None:
+                self.logger.debug(f"Commande non reconnue recu: {command} handlers={list(self._command_handlers.keys())}")
                 await self.send_message(
                     "Commande inconnue. Envoyez /help pour la liste des commandes."
                 )
                 continue
 
             try:
-                result = handler()
+                # Appeler le handler en tentant de lui passer le texte
+                # s'il accepte au moins un parametre. Ceci permet d'avoir
+                # des handlers du type `def handler(text: str)` pour parser
+                # des arguments (ex: "/run EURUSD,1HZ75V"). Si le handler
+                # n'accepte pas d'argument, on l'appelle sans parametre.
+                try:
+                    params_count = len(inspect.signature(handler).parameters)
+                except Exception:
+                    params_count = 0
+
+                if params_count == 0:
+                    result = handler()
+                else:
+                    result = handler(text)
+
                 if asyncio.iscoroutine(result):
                     result = await result
                 if isinstance(result, str) and result:

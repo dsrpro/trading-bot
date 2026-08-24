@@ -1,9 +1,11 @@
 """Point d'entree principal du bot de trading.
 
 Supporte les modes:
+    - scalper: Lancer le scalper multi-symboles (objectif $60 USD profit/jour)
     - backtest: Executer un backtesting sur donnees synthetiques
     - dry-run: Lancer le bot en simulation sans API
     - paper: Lancer le bot avec connexion API demo Deriv
+    - phase2: Paper trading avance avec filtres
     - report: Afficher un rapport de risque
 """
 
@@ -15,6 +17,16 @@ import logging
 import signal
 import sys
 from pathlib import Path
+
+
+def _configure_console_encoding() -> None:
+    """Avoid Windows cp1252 crashes when logs/prints contain Unicode."""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
+_configure_console_encoding()
 
 from src.backtester import Backtester
 from src.candle_builder import CandleBuilder
@@ -55,54 +67,39 @@ class TradingBot:
         self._trades_executed = 0
 
     async def run_dry_run(self, duration_minutes: int = 30, tick_interval: float = 0.1) -> None:
-        """Execute le bot en mode dry-run (simulation complete).
-
-        Genere des ticks synthetiques et simule le cycle de trading complet.
-
-        Args:
-            duration_minutes: Duree de la simulation en minutes.
-            tick_interval: Intervalle entre les ticks en secondes.
-        """
+        """Execute le bot en mode dry-run (simulation complete)."""
         self.logger.info(f"=== DEMARRAGE DRY-RUN ({duration_minutes} min) ===")
         self._running = True
 
-        # Generateur de ticks synthetiques (mouvement brownien)
         import numpy as np
         import time as _time
 
         np.random.seed(42)
-        price = 100.0
+        price = 1000.0
         start_time = _time.time()
         end_time = start_time + duration_minutes * 60
 
-        # Connecter le data streamer au candle builder
         self.data_streamer.subscribe(lambda tick: self.candle_builder.process_tick(tick))
 
-        # Callback a chaque bougie fermee pour evaluer la strategie
         async def on_candle_closed(candle):
             nonlocal self
-            # Evaluer la strategie
             signal = self.strategy_engine.evaluate()
             self._signals_generated += 1
 
             if signal.is_valid:
-                # Verifier les regles de risque
                 can_trade, report = self.risk_manager.can_place_trade(signal)
                 if can_trade:
-                    # Executer l'ordre
                     order = await self.order_executor.execute_signal(signal, report.position_size)
                     if order:
                         self.risk_manager.on_trade_opened(order.amount)
                         self._trades_executed += 1
                         self.logger.info(f"[EXECUTION] Trade #{self._trades_executed} | {signal.direction.value} @ {signal.entry_price:.5f}")
 
-            # Verifier les ordres ouverts (SL/TP)
             for order in self.order_executor.active_orders[:]:
                 closed = await self.order_executor.simulate_price_movement(order, candle.close)
                 if closed:
                     self.risk_manager.on_trade_closed(closed.pnl, closed.exit_price, closed.entry_price)
 
-            # Log du rapport toutes les 50 bougies
             if self.candle_builder.count() % 50 == 0:
                 report = self.risk_manager.get_report()
                 self.logger.info(
@@ -116,8 +113,7 @@ class TradingBot:
 
         tick_count = 0
         while self._running and _time.time() < end_time:
-            # Generer un tick synthetique
-            returns = np.random.normal(0, 0.0003)  # ~0.03% volatilite par tick
+            returns = np.random.normal(0, 0.0003)
             cycle = 0.002 * np.sin(2 * np.pi * tick_count / 500)
             returns += cycle / 500
             price *= (1 + returns)
@@ -134,7 +130,6 @@ class TradingBot:
 
             await asyncio.sleep(tick_interval)
 
-        # Rapport final
         self._print_final_report()
 
     def _print_final_report(self) -> None:
@@ -151,6 +146,11 @@ class TradingBot:
         self.logger.info(f"Peak capital:       ${report.peak_capital:.2f}")
         self.logger.info(f"Total trades:       {self.risk_manager.total_trades}")
         self.logger.info(f"Win rate:           {self.risk_manager.win_rate*100:.1f}%")
+        try:
+            rejects = getattr(self.order_executor, 'min_stake_rejections', 0)
+            self.logger.info(f"Rejets MIN_STAKE:    {rejects}")
+        except Exception:
+            pass
         self.logger.info(f"Ticks traites:      {self._ticks_processed}")
         self.logger.info(f"Signaux generes:    {self._signals_generated}")
         self.logger.info(f"Trades executes:    {self._trades_executed}")
@@ -182,27 +182,16 @@ def cmd_backtest(config: Config) -> None:
         print(f"  {key.replace('_', ' ').title():30s}: {value}")
     print("=" * 60)
 
-    # Interpretation
-    print("\n--- INTERPRETATION ---")
-    if result.profit_factor > 1.5 and result.sharpe_ratio > 1.0 and result.max_drawdown_pct < 20:
-        print("✓ La strategie montre des resultats prometteurs.")
-    else:
-        print("⚠ La strategie necessite des ajustements avant production.")
-    if result.total_trades < 10:
-        print("⚠ Trop peu de trades pour une evaluation statistique fiable.")
-
 
 async def cmd_dry_run(config: Config, duration: int) -> None:
     """Commande dry-run."""
     bot = TradingBot(config)
-
-    # Gestion du Ctrl+C
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, bot.stop)
         except NotImplementedError:
-            pass  # Windows ne supporte pas add_signal_handler
+            pass
 
     try:
         await bot.run_dry_run(duration_minutes=duration, tick_interval=0.05)
@@ -225,18 +214,14 @@ async def cmd_paper(config: Config, duration: int = 60) -> None:
         return
 
     deriv_client = DerivClient(config, logger)
-
-    # Connexion
     connected = await deriv_client.connect()
     if not connected:
         logger.error("Impossible de se connecter a l'API Deriv")
         return
 
-    # Souscription aux ticks
     await deriv_client.subscribe_ticks(config.market_symbol)
     logger.info(f"Souscrit aux ticks de {config.market_symbol}")
 
-    # Lancer le bot (similaire a dry-run mais avec l'API)
     bot = TradingBot(config)
     try:
         await bot.run_dry_run(duration_minutes=duration, tick_interval=1.0)
@@ -247,7 +232,7 @@ async def cmd_paper(config: Config, duration: int = 60) -> None:
 
 
 async def cmd_phase2(config: Config, duration: int = 60, use_api: bool = False) -> None:
-    """Commande Phase 2 de paper trading avec filtres avancés."""
+    """Commande Phase 2 de paper trading avec filtres avances."""
     logger = setup_logger(config, "paper_phase2")
     logger.info("=== PAPER TRADING PHASE 2 ===")
 
@@ -266,7 +251,7 @@ async def cmd_phase2(config: Config, duration: int = 60, use_api: bool = False) 
         summary = engine._build_session_summary(duration)
     finally:
         print("\n" + "=" * 60)
-        print("   PHASE 2 — RÉSUMÉ DE LA SESSION")
+        print("   PHASE 2 — RESUME DE LA SESSION")
         print("=" * 60)
         r = summary["results"]
         a = summary["activity"]
@@ -278,10 +263,8 @@ async def cmd_phase2(config: Config, duration: int = 60, use_api: bool = False) 
         print(f"  Win rate:            {r['win_rate']:.1f}%")
         print(f"  Actual R:R:          {r['actual_risk_reward_ratio']:.2f}")
         print(f"  Ticks:               {a['ticks_received']}")
-        print(f"  Signaux générés:     {a['signals_generated']}")
-        print(f"  Trades exécutés:     {a['trades_executed']}")
-        print(f"  Filtres:             Trend={c['trend_filter']} Vol={c['volatility_filter']} "
-              f"ATR-SL={c['atr_stops']} Trailing={c['trailing_stop']}")
+        print(f"  Signaux generes:     {a['signals_generated']}")
+        print(f"  Trades executes:     {a['trades_executed']}")
         print("=" * 60)
 
 
@@ -307,13 +290,76 @@ def cmd_report(config: Config) -> None:
     print("=" * 50)
 
 
+async def cmd_scalper(config: Config, duration: int = 10, use_api: bool = False) -> None:
+    """Commande scalper multi-symboles (target $60 USD profit / jour)."""
+    from src.scalper_multi import MultiSymbolScalper
+    from src.deriv_client import DerivClient
+    from dataclasses import replace
+
+    logger = setup_logger(config, "scalper")
+    logger.info("=== SCALPER MULTI-SYMBOLES DERIV ($60/JOUR TARGET) ===")
+
+    if use_api:
+        config = replace(config, mode="paper_trading")
+
+    deriv_client = None
+    if use_api and config.deriv_token:
+        deriv_client = DerivClient(config, logger)
+        connected = False
+        if getattr(config, 'deriv_account_id', None):
+            logger.info(f"Connexion trading OTP pour le compte {config.deriv_account_id}...")
+            connected = await deriv_client.connect_trading(config.deriv_token, config.deriv_account_id)
+
+        if not connected:
+            logger.info("Connexion trading OTP indisponible, essai connexion publique...")
+            connected = await deriv_client.connect()
+            if connected:
+                logger.warning("Connexion publique active — execution en mode dry_run")
+                config = replace(config, mode="dry_run")
+            else:
+                logger.warning("Connexion API Deriv echouee, basculement en mode dry-run")
+                deriv_client = None
+                config = replace(config, mode="dry_run")
+        else:
+            # Reussite de la connexion trading authentifiee
+            try:
+                bal_res = await deriv_client.get_balance()
+                if bal_res and "balance" in bal_res:
+                    bal_obj = bal_res["balance"]
+                    real_balance = float(bal_obj.get("balance", config.initial_capital))
+                    logger.info(f"Solde reel du compte demo Deriv recupere: ${real_balance:.2f} USD")
+                    config = replace(config, initial_capital=real_balance)
+            except Exception as e:
+                logger.warning(f"Impossible de lire le solde du compte Deriv: {e}")
+
+    scalper = MultiSymbolScalper(config=config, logger=logger, deriv_client=deriv_client)
+    try:
+        summary = await scalper.run(duration_minutes=duration)
+    finally:
+        if deriv_client:
+            await deriv_client.disconnect()
+        print("\n" + "=" * 65)
+        print("          BILAN DE LA SESSION DE SCALPING MULTI-SYMBOLES")
+        print("=" * 65)
+        print(f"  Symboles traites:    {', '.join(summary['symbols_scanned'])}")
+        print(f"  Duree de session:    {summary['duration_seconds']} sec")
+        print(f"  Capital initial:     ${summary['initial_capital']:.2f}")
+        print(f"  Capital final:       ${summary['final_capital']:.2f}")
+        print(f"  PnL du jour:         ${summary['daily_pnl']:+.2f} ({summary['daily_pnl_pct']:+.2f}%)")
+        print(f"  Objectif $60 atteint: {'OUI 🎉' if summary['target_reached'] else 'Non'}")
+        print(f"  Trades executes:     {summary['total_trades']} ({summary['winning_trades']}W / {summary['losing_trades']}L)")
+        print(f"  Win rate:            {summary['win_rate']:.1f}%")
+        print("=" * 65)
+
+
 def main():
     """Point d'entree CLI."""
     parser = argparse.ArgumentParser(
-        description="Trading Bot — Bollinger Bands + RSI",
+        description="Trading Bot — Bollinger Bands + RSI Scalper",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Exemples:
+  python -m src.main scalper --duration 10 # Scalper multi-symboles ($60 target)
   python -m src.main backtest              # Lancer un backtest
   python -m src.main dry-run --duration 10 # Dry run 10 minutes
   python -m src.main paper                 # Paper trading (demo)
@@ -321,8 +367,8 @@ Exemples:
         """,
     )
 
-    parser.add_argument("command", nargs="?", default="backtest",
-                        choices=["backtest", "dry-run", "paper", "phase2", "report"],
+    parser.add_argument("command", nargs="?", default="scalper",
+                        choices=["scalper", "backtest", "dry-run", "paper", "phase2", "report"],
                         help="Commande a executer")
     parser.add_argument("--config", "-c", type=str, default=None,
                         help="Chemin vers le fichier .env")
@@ -334,7 +380,9 @@ Exemples:
     args = parser.parse_args()
     config = load_config(args.config)
 
-    if args.command == "backtest":
+    if args.command == "scalper":
+        asyncio.run(cmd_scalper(config, duration=args.duration, use_api=args.api))
+    elif args.command == "backtest":
         cmd_backtest(config)
     elif args.command == "dry-run":
         asyncio.run(cmd_dry_run(config, args.duration))
