@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from typing import Optional
 import numpy as np
@@ -88,6 +89,7 @@ class MultiSymbolScalper:
             self.telegram.register_command("/status", self._cmd_telegram_status)
             self.telegram.register_command("/report", self._cmd_telegram_report)
             self.telegram.register_command("/stop", self._cmd_telegram_stop)
+            self.telegram.register_command("/reset", self._cmd_telegram_reset)
 
     def _on_deriv_tick(self, tick_data: dict) -> None:
         """Callback appele pour chaque tick de marche recu en direct depuis l'API Deriv."""
@@ -119,8 +121,17 @@ class MultiSymbolScalper:
         self.logger.info("=" * 70)
 
         # Lancer le polling Telegram si disponible
+        self.logger.info(
+            f"[TELEGRAM] enabled={self.telegram.enabled} | "
+            f"token={'OK' if self.telegram.token else 'MANQUANT'} | "
+            f"chat_id={'OK' if self.telegram.chat_id else 'MANQUANT'} | "
+            f"TG_DISABLE_env={os.environ.get('TELEGRAM_DISABLE')!r}"
+        )
         if self.telegram.enabled:
             self.telegram.start_polling()
+            # Declarer les commandes aupres de Telegram (setMyCommands)
+            # pour qu'elles apparaissent dans le menu "/" du chat.
+            await self.telegram.sync_bot_commands()
             await self.telegram.send_message(
                 f"🚀 *DEMARRAGE SCALPER MULTI-SYMBOLES*\n"
                 f"📊 Symboles surveillés ({len(self.symbols)}): {', '.join(self.symbols)}\n"
@@ -143,6 +154,9 @@ class MultiSymbolScalper:
 
         last_report_time = time.time()
 
+        # Suivi de la dernière notification de verrouillage (évite le spam de logs)
+        _last_lock_notif: str = ""
+
         try:
             while self._running:
                 elapsed = time.time() - self._start_time
@@ -153,17 +167,66 @@ class MultiSymbolScalper:
                 report = self.risk_manager.get_report()
                 if not report.can_trade:
                     if report.status == RiskStatus.DAILY_PROFIT_TARGET_REACHED:
-                        msg = f"🎉 *OBJECTIF ATTEINT!* Profit du jour = ${report.daily_pnl:.2f}. Trading verrouillé pour la journée."
-                        self.logger.info(msg)
-                        if self.telegram.enabled:
-                            await self.telegram.send_message(msg)
+                        if _last_lock_notif != "profit":
+                            msg = (
+                                f"🎉 *OBJECTIF ATTEINT!* Profit du jour = ${report.daily_pnl:.2f}. "
+                                f"Trading verrouille jusqu'a demain."
+                            )
+                            self.logger.info(msg)
+                            if self.telegram.enabled:
+                                await self.telegram.send_message(msg)
+                            _last_lock_notif = "profit"
+                        # Attendre puis laisser _reset_daily_if_needed() deverrouiller au nouveau jour
+                        await asyncio.sleep(60)
+                        continue
+                    elif report.status == RiskStatus.DAILY_LOSS_LIMIT_REACHED:
+                        if _last_lock_notif != "stoploss":
+                            msg = (
+                                f"🛑 *STOP LOSS JOURNALIER!* "
+                                f"Perte = ${report.daily_pnl:.2f}. "
+                                f"Trading verrouille jusqu'a demain."
+                            )
+                            self.logger.warning(msg)
+                            if self.telegram.enabled:
+                                await self.telegram.send_message(msg)
+                            _last_lock_notif = "stoploss"
+                        await asyncio.sleep(60)
+                        continue
+                    elif report.status == RiskStatus.KILL_SWITCH_ACTIVATED:
+                        if _last_lock_notif != "killswitch":
+                            msg = f"🛑 *KILL SWITCH ACTIVE!* ({report.reason_blocked}). Arret definitif."
+                            self.logger.warning(msg)
+                            if self.telegram.enabled:
+                                await self.telegram.send_message(msg)
+                            _last_lock_notif = "killswitch"
+                        # Kill switch = drawdown max depasse = arret definitif
                         break
-                    elif report.status in (RiskStatus.DAILY_LOSS_LIMIT_REACHED, RiskStatus.KILL_SWITCH_ACTIVATED):
-                        msg = f"🛑 *STOP LOSS DECLENCHE!* ({report.reason_blocked}). Arret."
-                        self.logger.warning(msg)
+                else:
+                    # Nouveau jour detecte : le trading reprend
+                    if _last_lock_notif in ("profit", "stoploss"):
+                        self.logger.info("Nouveau jour detecte — reprise du trading.")
                         if self.telegram.enabled:
-                            await self.telegram.send_message(msg)
-                        break
+                            await self.telegram.send_message(
+                                "🌅 *NOUVEAU JOUR DE TRADING* — Compteurs reinitialises. Reprise du scalper."
+                            )
+                        _last_lock_notif = ""
+
+                # Resoudre les contrats reels en attente (resultat réel Deriv)
+                for closed_order in await self.executor.poll_contract_resolutions():
+                    rep = self.risk_manager.on_trade_closed(
+                        closed_order.pnl,
+                        closed_order.exit_price,
+                        closed_order.entry_price,
+                    )
+                    if self.telegram.enabled:
+                        icon = "🟢" if closed_order.pnl > 0 else "🔴"
+                        asyncio.create_task(self.telegram.send_message(
+                            f"{icon} *TRADE FERME* | {closed_order.symbol}\n"
+                            f"PnL: `${closed_order.pnl:+.2f}`\n"
+                            f"Sortie: `{closed_order.exit_price:.5f}`\n"
+                            f"Daily PnL: `${rep.daily_pnl:+.2f}` / `${self.config.daily_profit_target_usd:.2f}`\n"
+                            f"Solde actuel: `${rep.current_capital:.2f}`"
+                        ))
 
                 # Generer et evaluer les 6 symboles en parallele
                 for sym, ctx in self.contexts.items():
@@ -197,7 +260,7 @@ class MultiSymbolScalper:
                             else (ctx.candle_builder.candles[-1].close if len(ctx.candle_builder.candles) > 0 else 1000.0)
                         )
                         for order in list(self.executor.active_orders):
-                            if order.symbol == sym:
+                            if order.symbol == sym and order.contract_id is None:
                                 closed_order = await self.executor.simulate_price_movement(order, current_price)
                                 if closed_order:
                                     rep = self.risk_manager.on_trade_closed(
@@ -239,7 +302,7 @@ class MultiSymbolScalper:
         report = self.risk_manager.get_report()
         return (
             f"📊 *STATUT SCALPER MULTI-SYMBOLES*\n"
-            f"Symboles surveilles (6): {', '.join(self.symbols)}\n"
+            f"Symboles surveilles ({len(self.symbols)}): {', '.join(self.symbols)}\n"
             f"Capital actuel: ${report.current_capital:.2f}\n"
             f"PnL du jour: ${report.daily_pnl:+.2f} / ${self.config.daily_profit_target_usd:.2f}\n"
             f"Trades aujourd'hui: {report.trades_today}/{report.max_trades_per_day}\n"
@@ -260,6 +323,15 @@ class MultiSymbolScalper:
     def _cmd_telegram_stop(self, text: str = "") -> str:
         self._running = False
         return "🛑 Arrêt du scalper demandé via Telegram."
+
+    def _cmd_telegram_reset(self, text: str = "") -> str:
+        """Reinitialise les compteurs quotidiens pour reprendre le trading."""
+        self.risk_manager.reset_daily_counters()
+        return (
+            "🔄 *REINITIALISATION JOURNALIERE*\n"
+            "Compteurs P&L et trades remis à zéro.\n"
+            "Le trading peut reprendre."
+        )
 
     async def _preload_all_candles(self) -> None:
         """Genere ou charge des bougies initiales pour chaque symbole (API ou simulation)."""

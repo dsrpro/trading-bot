@@ -618,8 +618,8 @@ class PaperTradingPhase2:
 
         # Calculer le ratio R:R réel
         actual_rr = 0.0
-        if self.order_executor.active_orders:
-            closed_orders = [o for o in self.order_executor._order_history]
+        closed_orders = [o for o in self.order_executor._order_history]
+        if closed_orders:
             wins = [o.pnl for o in closed_orders if o.pnl > 0]
             losses = [abs(o.pnl) for o in closed_orders if o.pnl <= 0]
             avg_win = np.mean(wins) if wins else 0

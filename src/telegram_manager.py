@@ -45,6 +45,7 @@ class TelegramManager:
         "/resume": "Desactive le kill switch",
         "/stop": "Arret propre du bot",
         "/choose": "Selectionner par index",
+        "/reset": "Reinitialiser les compteurs du jour",
     }
 
     def __init__(

@@ -50,6 +50,8 @@ class Order:
     pnl: float = 0.0
     pnl_pct: float = 0.0
     contract_id: Optional[str] = None
+    payout: float = 0.0              # Montant restitue en cas de victoire (Deriv)
+    contract_purchase_time: float = 0.0
     signal_score: float = 0.0
     signal_confidence: float = 0.0
 
@@ -103,6 +105,11 @@ class OrderExecutor:
 
         self._active_orders: dict[str, Order] = {}
         self._order_history: list[Order] = []
+        # Contrats reels Deriv en attente de resolution (contract_id -> Order)
+        self._contract_orders: dict[str, Order] = {}
+        # Throttle du polling des resultats pour eviter de marteler l'API
+        self._last_contract_poll_ts: float = 0.0
+        self._contract_poll_interval: float = 3.0  # secondes
         self._simulation_latency_ms: float = 100.0  # Latence simulee
         # Compteur de rejets due a min_stake
         self.min_stake_rejections: int = 0
@@ -169,6 +176,10 @@ class OrderExecutor:
         Returns:
             Order mis a jour si ferme (SL/TP touche), None sinon.
         """
+        # Un contrat reel Deriv se resout via l'API (voir poll_contract_resolutions),
+        # pas via une simulation SL/TP sur bougies M1.
+        if order.contract_id:
+            return None
         if order.direction == SignalDirection.CALL:
             # CALL: profit si le prix monte
             if current_price <= order.stop_loss:
@@ -312,7 +323,9 @@ class OrderExecutor:
             return None
 
         # Acheter le contrat
+        self.logger.info(f"Tentative d'achat: proposal_id={proposal_id}, ask_price={ask_price}")
         buy_result = await self.deriv_client.buy_contract(proposal_id, ask_price)
+        self.logger.info(f"Reponse achat: {buy_result}")
 
         if not buy_result or buy_result.get("error"):
             error_msg = buy_result.get("error", {}).get("message", "Unknown") if buy_result else "No response"
@@ -320,6 +333,16 @@ class OrderExecutor:
             return None
 
         contract_id = str(buy_result.get("buy", {}).get("contract_id", ""))
+        if not contract_id:
+            self.logger.error(f"Achat reussi mais sans contract_id: {buy_result}")
+            return None
+
+        self.logger.info(f"Achat reussi: contract_id={contract_id}")
+
+        # Payout reelle (montant restitue en cas de victoire) et date d'achat
+        buy_info = buy_result.get("buy", {})
+        payout = float(buy_info.get("payout", 0.0) or 0.0)
+        purchase_time = float(buy_info.get("purchase_time", 0.0) or 0.0)
 
         order_id = str(uuid.uuid4())[:8]
         order = Order(
@@ -333,11 +356,15 @@ class OrderExecutor:
             status=OrderStatus.EXECUTED,
             opened_at=datetime.now(timezone.utc).timestamp(),
             contract_id=contract_id,
+            payout=payout,
+            contract_purchase_time=purchase_time,
             signal_score=signal.score,
             signal_confidence=signal.confidence,
         )
 
         self._active_orders[order_id] = order
+        # Suivre ce contrat reel pour recuperer son resultat via l'API Deriv
+        self._contract_orders[contract_id] = order
 
         log_trade(
             self.logger,
@@ -357,12 +384,70 @@ class OrderExecutor:
         self.logger.info(
             f"[PAPER] Ordre execute #{order_id} | "
             f"Contract={contract_id} | {signal.direction.value} | "
-            f"Amount=${amount:.2f}"
+            f"Amount=${amount:.2f} | Payout=${payout:.2f}"
         )
 
         return order
 
+    async def poll_contract_resolutions(self) -> list[Order]:
+        """Recupere le resultat reel des contrats Deriv en attente et les clot.
+
+        Utilise l'API Deriv (proposal_open_contract) pour connaitre le vrai
+        PnL de chaque contrat, plutot que la simulation SL/TP interne. Les
+        contrats resolus sont deplaces vers l'historique et retournes pour
+        que l'appelant puisse mettre a jour le RiskManager.
+
+        Returns:
+            Liste des ordres fermes par le resultat reel Deriv.
+        """
+        closed: list[Order] = []
+        if not self.deriv_client:
+            return closed
+        if not self._contract_orders:
+            return closed
+
+        # Throttle: ne pas interroger les contrats a chaque boucle (0.5s)
+        now = datetime.now(timezone.utc).timestamp()
+        if now - self._last_contract_poll_ts < self._contract_poll_interval:
+            return closed
+        self._last_contract_poll_ts = now
+
+        for contract_id, order in list(self._contract_orders.items()):
+            poc = await self.deriv_client.get_contract(contract_id)
+            if not poc:
+                continue
+            if poc.get("error"):
+                self.logger.warning(
+                    f"Erreur lecture contrat {contract_id}: "
+                    f"{poc['error'].get('message', 'inconnue')}"
+                )
+                continue
+
+            contract = poc.get("proposal_open_contract", {})
+            if not contract or not contract.get("is_sold"):
+                continue  # Contrat encore en cours
+
+            profit = float(contract.get("profit", 0.0) or 0.0)
+            sell_price = float(contract.get("sell_spot", order.entry_price) or order.entry_price)
+
+            order.exit_price = sell_price
+            order.pnl = profit
+            order.pnl_pct = (profit / order.amount * 100.0) if order.amount > 0 else 0.0
+            order.status = OrderStatus.COMPLETED
+            order.closed_at = datetime.now(timezone.utc).timestamp()
+
+            self._archive_order(order)
+            closed.append(order)
+            self.logger.info(
+                f"Contrat resolu {contract_id} | {order.direction.value} | "
+                f"PnL=${profit:+.2f} ({order.pnl_pct:+.2f}%) | Exit={sell_price:.5f}"
+            )
+
+        return closed
+
     def _archive_order(self, order: Order) -> None:
         """Deplace un ordre de actif vers l'historique."""
         self._active_orders.pop(order.order_id, None)
+        if order.contract_id:
+            self._contract_orders.pop(order.contract_id, None)
         self._order_history.append(order)

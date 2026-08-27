@@ -119,6 +119,7 @@ class DerivClient:
         """Ferme proprement la connexion WebSocket."""
         self._running = False
         self._connected = False
+        self._mode = "public"  # Reset mode to public on disconnect
         if self._ws:
             try:
                 await self._ws.close()
@@ -332,8 +333,14 @@ class DerivClient:
 
     async def get_proposal(self, contract_type: str, symbol: str, amount: float,
                            basis: str = "stake", duration: int = 1,
-                           duration_unit: str = "t") -> Optional[dict]:
-        """Obtient une proposition de contrat (necessite auth trading)."""
+                           duration_unit: str = "m") -> Optional[dict]:
+        """Obtient une proposition de contrat (necessite auth trading).
+
+        Par defaut le contrat dure `duration` (ex: 1 minute) afin d'etre
+        aligne sur le timeframe M1 des signaux de la strategie (au lieu d'un
+        contrat "1 tick" qui se resout en ~1 seconde et ignore totalement
+        la logique Bollinger/RSI basee sur les bougies M1).
+        """
         if self._mode != "trading":
             self.logger.warning("get_proposal necessite le mode trading")
             return None
@@ -351,6 +358,21 @@ class DerivClient:
     async def buy_contract(self, proposal_id: str, price: float) -> Optional[dict]:
         """Execute l'achat d'un contrat."""
         return await self._send_request({"buy": proposal_id, "price": price})
+
+    async def get_contract(self, contract_id) -> Optional[dict]:
+        """Recupere l'etat d'un contrat, y compris son resultat une fois vendu.
+
+        Le champ 'is_sold' indique que le contrat est termine et 'profit'
+        donne le PnL reel en USD. Permet au bot d'utiliser le vrai resultat
+        Deriv plutot qu'une simulation SL/TP interne.
+        """
+        try:
+            return await self._send_request(
+                {"proposal_open_contract": 1, "contract_id": int(contract_id)}
+            )
+        except (ValueError, TypeError):
+            self.logger.warning(f"contract_id invalide pour get_contract: {contract_id}")
+            return None
 
     def _next_req_id(self) -> int:
         self._req_id += 1

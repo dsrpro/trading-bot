@@ -166,8 +166,8 @@ class RiskManager:
             report.can_trade = False
             report.reason_blocked = f"Perte quotidienne (PnL=${self._daily_pnl:.2f}, {daily_loss_pct:.2f}%) atteinte"
             self.logger.warning(f"Trade bloque: {report.reason_blocked}")
-            self._kill_switch = True
-            self._blocked_reason = report.reason_blocked
+            # NOTE: on ne déclenche PAS le kill switch ici — le stop-loss journalier est
+            # temporaire (jusqu'au lendemain). Le kill switch est réservé au drawdown max.
             return False, report
 
         # 3. Objectif de profit quotidien (en % et en USD)
@@ -371,7 +371,18 @@ class RiskManager:
         max_stake = getattr(self.config, 'max_stake_usd', 25.0)
         if max_stake > 0:
             risk_amount = min(risk_amount, max_stake)
-        return round(max(risk_amount, float(self.config.min_stake)), 2)
+        min_stake = float(self.config.min_stake)
+        final_amount = max(risk_amount, min_stake)
+        # Logger le calcul pour debug
+        self.logger.debug(
+            f"Position size: capital={self.current_capital:.2f}, "
+            f"risk_pct={self.config.risk_per_trade_pct}%, "
+            f"risk_amount={self.current_capital * (self.config.risk_per_trade_pct / 100.0):.2f}, "
+            f"max_stake={max_stake:.2f}, "
+            f"min_stake={min_stake:.2f}, "
+            f"final={final_amount:.2f}"
+        )
+        return round(final_amount, 2)
 
     def _calculate_drawdown_pct(self) -> float:
         """Calcule le drawdown actuel en pourcentage.

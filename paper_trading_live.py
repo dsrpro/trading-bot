@@ -29,6 +29,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
+import subprocess
+import os
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -43,6 +45,15 @@ from src.order_executor import OrderExecutor
 from src.risk_manager import RiskManager
 from src.strategy_engine import SignalDirection, StrategyEngine, TradingSignal
 from src.telegram_manager import TelegramManager
+from src.markets import resolve_symbol, list_markets, MARKET_CATALOG
+from src.instance_registry import (
+    register_instance,
+    unregister_instance,
+    list_instances,
+    update_instance,
+    append_event,
+    read_new_events,
+)
 
 
 def fetch_account_id(config: Config) -> str:
@@ -95,20 +106,30 @@ class PaperTradingLive:
         self.public_client = DerivClient(config, self.logger)    # ticks
         self.trading_client = DerivClient(config, self.logger)   # ordres
 
-        # L'OrderExecutor utilise le client trading pour les ordres
-        self.order_executor = OrderExecutor(config, deriv_client=self.trading_client, logger=self.logger)
-
         # Telegram (alertes + commandes distantes)
         self.telegram = TelegramManager(config, self.logger)
         self._register_telegram_commands()
 
+        # L'OrderExecutor utilise le client trading pour les ordres
+        # On lui passe aussi le TelegramManager pour notifications optionnelles
+        self.order_executor = OrderExecutor(
+            config,
+            deriv_client=self.trading_client,
+            logger=self.logger,
+            telegram_manager=self.telegram,
+        )
+
         # État
         self._running = False
+        self._paused = False
         self._ticks_received = 0
         self._signals_evaluated = 0
         self._trades_opened = 0
         self._trades_closed = 0
         self._last_status_time = 0.0
+        # Forwarder d'événements : seule l'instance avec Telegram actif
+        # lit la file partagée et relaie les trades de TOUS les indices.
+        self._events_offset = 0
 
     def _register_telegram_commands(self) -> None:
         """Enregistre les commandes Telegram disponibles."""
@@ -127,6 +148,9 @@ class PaperTradingLive:
             "📊 *Commandes disponibles*\n"
             "/status — Etat actuel du bot\n"
             "/report — Rapport de risque\n"
+            "/run SYM1,SYM2,... — Demarrer le bot sur un ou plusieurs symboles\n"
+            "/markets — Lister les marchés disponibles\n"
+            "/choose — Selectionner par index (envoyez /choose pour la liste)\n"
             "/kill — Arret d'urgence (kill switch)\n"
             "/resume — Desactive le kill switch\n"
             "/stop — Arret propre du bot"
@@ -134,23 +158,116 @@ class PaperTradingLive:
 
     def _tg_status(self) -> str:
         state = "EN COURS" if self._running else "ARRETE"
-        return (
-            f"🤖 *Etat:* {state}\n"
-            f"📡 Ticks recus: {self._ticks_received}\n"
-            f"🕯 Bougies: {self.candle_builder.count()}\n"
-            f"📈 Trades ouverts: {self._trades_opened} / fermes: {self._trades_closed}\n"
-            f"🛑 Kill switch: {'ACTIF' if self.risk_manager.is_kill_switch_active else 'inactif'}"
-        )
+        open_orders = len(self.order_executor.active_orders) if hasattr(self.order_executor, 'active_orders') else self._trades_opened
+        report = self.risk_manager.get_report()
+        lines = [
+            f"🤖 *Etat:* {state}",
+            f"📅 *Heure:* {datetime.now(timezone.utc).astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}",
+            f"📡 *Ticks reçus:* {self._ticks_received}",
+            f"🕯 *Bougies:* {self.candle_builder.count()}",
+            f"📈 *Positions ouvertes:* {open_orders}",
+            f"💰 *Capital:* ${report.current_capital:.2f} (init ${report.initial_capital:.2f})",
+            f"📊 *P&L:* ${report.total_pnl:+.2f} ({report.total_pnl_pct:+.2f}%)",
+            f"📉 *Drawdown max:* {report.drawdown_pct:.2f}%",
+            f"🔁 *Trades aujourd'hui:* {report.trades_today}/{report.max_trades_per_day}",
+            f"✅ *Win rate:* {self.risk_manager.win_rate*100:.1f}%",
+        ]
+        # Vue agrégée de toutes les instances (ce processus + enfants via /run)
+        try:
+            others = list_instances()
+            if others:
+                lines.append('\n*📊 Vue multi-indices:*')
+                for inst in others:
+                    sym = inst.get('symbol', '?')
+                    pnl = inst.get('pnl', 0.0)
+                    wr = inst.get('win_rate', 0.0)
+                    trades = inst.get('trades', 0)
+                    positions = inst.get('positions', []) or []
+                    lines.append(
+                        f"• {sym}: P&L ${pnl:+.2f} | WR {wr:.1f}% | "
+                        f"{len(positions)} pos | {trades} trades"
+                    )
+        except Exception:
+            pass
+
+        return "\n".join(lines)
 
     def _tg_report(self) -> str:
         report = self.risk_manager.get_report()
-        return (
-            f"💰 Capital: ${report.current_capital:.2f} (initial ${report.initial_capital:.2f})\n"
-            f"📊 P&L: ${report.total_pnl:+.2f} ({report.total_pnl_pct:+.2f}%)\n"
-            f"📉 Drawdown: {report.drawdown_pct:.2f}%\n"
-            f"🔁 Trades aujourd'hui: {report.trades_today}/{report.max_trades_per_day}\n"
-            f"✅ Win rate: {self.risk_manager.win_rate*100:.1f}%"
-        )
+        now = datetime.now(timezone.utc).astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')
+        lines = [
+            f"📈 *Rapport de trading* — {now}",
+            f"💰 *Capital actuel:* ${report.current_capital:.2f}  — *Initial:* ${report.initial_capital:.2f}",
+            f"📊 *P&L total:* ${report.total_pnl:+.2f} ({report.total_pnl_pct:+.2f}%)",
+            f"📉 *Drawdown max:* {report.drawdown_pct:.2f}%",
+            f"🔁 *Trades aujourd'hui:* {report.trades_today}/{report.max_trades_per_day}",
+            f"✅ *Win rate:* {self.risk_manager.win_rate*100:.1f}%",
+        ]
+
+        # Ajouter compteur de rejets pour montant inferieur a MIN_STAKE
+        try:
+            rejets = getattr(self.order_executor, 'min_stake_rejections', 0)
+            lines.append(f"⚠️ *Rejets (MIN_STAKE):* {rejets}")
+        except Exception:
+            pass
+
+        # Ajouter positions ouvertes détaillées si présentes
+        try:
+            active = getattr(self.order_executor, 'active_orders', []) or []
+            if active:
+                lines.append('\n*Positions ouvertes:*')
+                for o in active:
+                    # o should have direction, amount, entry_price, stop_loss, take_profit
+                    d = getattr(o, 'direction', getattr(o, 'side', ''))
+                    amt = getattr(o, 'amount', getattr(o, 'size', 0.0))
+                    entry = getattr(o, 'entry_price', getattr(o, 'price', 0.0))
+                    sl = getattr(o, 'stop_loss', '-')
+                    tp = getattr(o, 'take_profit', '-')
+                    lines.append(f"- {getattr(d, 'value', str(d))} | Montant=${amt:.2f} | Entry={entry} | SL={sl} | TP={tp}")
+        except Exception:
+            pass
+
+        # Ajouter résumé des derniers trades si dispo
+        try:
+            last = getattr(self.risk_manager, 'last_closed_trade', None)
+            if last:
+                lines.append('\n*Dernier trade fermé:*')
+                lines.append(f"{getattr(last, 'direction', '')} PnL=${getattr(last, 'pnl', 0.0):+.2f} Entry={getattr(last,'entry', '')} Exit={getattr(last,'exit','')}")
+        except Exception:
+            pass
+
+        # Vue agrégée des positions ouvertes de TOUS les indices
+        try:
+            others = list_instances()
+            has_positions = any(inst.get('positions') for inst in others)
+            if has_positions:
+                lines.append('\n*🎯 Positions ouvertes (tous indices):*')
+                for inst in others:
+                    pos_list = inst.get('positions', []) or []
+                    for p in pos_list:
+                        lines.append(
+                            f"• {inst.get('symbol')} {p.get('direction')} "
+                            f"Entry={p.get('entry_price')} SL={p.get('stop_loss')} "
+                            f"TP={p.get('take_profit')}"
+                        )
+        except Exception:
+            pass
+
+        # Synthèse P&L par instance (cross-process)
+        try:
+            others = list_instances()
+            if others:
+                lines.append('\n*📊 P&L par indice:*')
+                for inst in others:
+                    lines.append(
+                        f"• {inst.get('symbol')}: P&L ${inst.get('pnl', 0.0):+.2f} | "
+                        f"WR {inst.get('win_rate', 0.0):.1f}% | "
+                        f"{inst.get('trades', 0)} trades | ${inst.get('capital', 0.0):.2f}"
+                    )
+        except Exception:
+            pass
+
+        return "\n".join(lines)
 
     def _tg_kill(self) -> str:
         if not self._running:
@@ -162,11 +279,14 @@ class PaperTradingLive:
 
     def _tg_resume(self) -> str:
         self.risk_manager.deactivate_kill_switch()
+        self._paused = False
+        self._running = True
         return "✅ Kill switch desactive — trading autorise a nouveau."
 
     def _tg_stop(self) -> str:
-        self._running = False
-        return "⏹ Arret propre demande — le bot va se couper."
+        self._paused = True
+        self._running = True
+        return "⏹ Arret propre demande — le bot est mis en pause."
 
     async def _preload_history(self) -> int:
         """Pre-charge l'historique OHLC dans le CandleBuilder avant le flux live.
@@ -285,7 +405,14 @@ class PaperTradingLive:
         # 4. Boucle de trading
         print(f"\n[4/4] Boucle de trading lancée — Ctrl+C pour arrêter\n")
         self._running = True
+        self._paused = False
         self._last_status_time = _time.time()
+
+        # Register this running instance so /report can show active symbols
+        try:
+            register_instance(self.symbol, pid=os.getpid())
+        except Exception:
+            self.logger.exception("Impossible d'enregistrer l'instance dans le registre")
 
         # Wiring des callbacks
         self.data_streamer.subscribe(lambda tick: self.candle_builder.process_tick(tick))
@@ -308,10 +435,30 @@ class PaperTradingLive:
         end = start + duration_minutes * 60 if duration_minutes > 0 else float("inf")
 
         while self._running and _time.time() < end:
+            if self._paused:
+                await asyncio.sleep(0.5)
+                continue
             await asyncio.sleep(0.1)
+            # Résoudre les contrats réels en attente (vrai résultat Deriv)
+            for closed in await self.order_executor.poll_contract_resolutions():
+                self._trades_closed += 1
+                self.risk_manager.on_trade_closed(closed.pnl, closed.exit_price, closed.entry_price)
+                self.logger.info(
+                    f"[CLÔTURE] {closed.direction.value} | Entry={closed.entry_price:.5f} "
+                    f"Exit={closed.exit_price:.5f} | PnL=${closed.pnl:+.2f}"
+                )
+                await self._notify(
+                    f"🔴 *CLOTURE* {closed.direction.value} — {self.symbol}\n"
+                    f"Entry={closed.entry_price:.5f} Exit={closed.exit_price:.5f}\n"
+                    f"PnL=${closed.pnl:+.2f}"
+                )
+                self._sync_registry()
+            # Relayer vers Telegram les événements des instances enfants
+            await self._forward_events()
             # Statut périodique toutes les 60s
             if _time.time() - self._last_status_time >= 60:
                 self._log_status()
+                self._sync_registry()
                 self._last_status_time = _time.time()
 
         # Clôture
@@ -323,26 +470,62 @@ class PaperTradingLive:
         self.data_streamer.on_tick(tick_data)
         self._ticks_received += 1
 
+    async def _notify(self, message: str) -> None:
+        """Notifie un événement de trading, taggé par symbole.
+
+        - Si Telegram est actif (instance « mère ») : envoi direct au chat.
+        - Sinon (instance enfant lancée via /run) : écrit dans la file
+          d'événements partagée ; la mère la reliera vers Telegram.
+
+        C'est ce qui permet de remonter les trades de TOUS les indices,
+        même quand plusieurs instances tournent en parallèle.
+        """
+        if self.telegram.enabled:
+            await self.telegram.send_message(message)
+        else:
+            append_event({
+                "pid": os.getpid(),
+                "symbol": self.symbol,
+                "message": message,
+            })
+
+    async def _forward_events(self) -> None:
+        """Instance mère : relaie vers Telegram les événements des enfants.
+
+        Appelée périodiquement dans la boucle principale. Sans effet si
+        Telegram est désactivé (instance enfant).
+        """
+        if not self.telegram.enabled:
+            return
+        try:
+            events, self._events_offset = read_new_events(self._events_offset)
+        except Exception:
+            return
+        for ev in events:
+            msg = ev.get("message")
+            if not msg:
+                continue
+            await self.telegram.send_message(msg)
+
     async def _on_candle_closed(self, candle: Candle) -> None:
         """Évalué à chaque bougie fermée."""
         self._signals_evaluated += 1
 
-        # 1. Vérifier les positions ouvertes (SL/TP simulé côté bot)
-        for order in self.order_executor.active_orders[:]:
-            closed = await self.order_executor.simulate_price_movement(order, candle.close)
-            if closed:
-                self._trades_closed += 1
-                self.risk_manager.on_trade_closed(closed.pnl, closed.exit_price, closed.entry_price)
-                self.logger.info(
-                    f"[CLÔTURE] {closed.direction.value} | "
-                    f"Entry={closed.entry_price:.5f} Exit={closed.exit_price:.5f} | "
-                    f"PnL=${closed.pnl:+.2f}"
-                )
-                await self.telegram.send_message(
-                    f"🔴 *CLOTURE* {closed.direction.value}\n"
-                    f"Entry={closed.entry_price:.5f} Exit={closed.exit_price:.5f}\n"
-                    f"PnL=${closed.pnl:+.2f}"
-                )
+        # 1. Résoudre les contrats réels via l'API Deriv (vrai résultat)
+        for closed in await self.order_executor.poll_contract_resolutions():
+            self._trades_closed += 1
+            self.risk_manager.on_trade_closed(closed.pnl, closed.exit_price, closed.entry_price)
+            self.logger.info(
+                f"[CLÔTURE] {closed.direction.value} | "
+                f"Entry={closed.entry_price:.5f} Exit={closed.exit_price:.5f} | "
+                f"PnL=${closed.pnl:+.2f}"
+            )
+            await self._notify(
+                f"🔴 *CLOTURE* {closed.direction.value} — {self.symbol}\n"
+                f"Entry={closed.entry_price:.5f} Exit={closed.exit_price:.5f}\n"
+                f"PnL=${closed.pnl:+.2f}"
+            )
+            self._sync_registry()
 
         # 2. Évaluer la stratégie
         signal = self.strategy_engine.evaluate()
@@ -366,11 +549,42 @@ class PaperTradingLive:
             f"[OUVERTURE] {signal.direction.value} @ {signal.entry_price:.5f} | "
             f"Amount=${order.amount:.2f} | SL={order.stop_loss:.5f} TP={order.take_profit:.5f}"
         )
-        await self.telegram.send_message(
-            f"🟢 *OUVERTURE* {signal.direction.value} @ {signal.entry_price:.5f}\n"
-            f"Amount=${order.amount:.2f}\n"
+        await self._notify(
+            f"🟢 *OUVERTURE* {signal.direction.value} — {self.symbol}\n"
+            f"@ {signal.entry_price:.5f} | Amount=${order.amount:.2f}\n"
             f"SL={order.stop_loss:.5f} TP={order.take_profit:.5f}"
         )
+        self._sync_registry()
+
+    def _sync_registry(self) -> None:
+        """Met à jour l'état de cette instance dans le registre partagé.
+
+        Permet aux autres instances (et à /status //report via Telegram)
+        de voir en temps réel les positions ouvertes, le P&L et le win rate
+        de chaque indice, même dans des processus séparés.
+        """
+        try:
+            report = self.risk_manager.get_report()
+            positions = []
+            for o in self.order_executor.active_orders:
+                positions.append({
+                    "direction": getattr(o.direction, "value", str(o.direction)),
+                    "entry_price": o.entry_price,
+                    "amount": o.amount,
+                    "stop_loss": o.stop_loss,
+                    "take_profit": o.take_profit,
+                })
+            update_instance(
+                os.getpid(),
+                symbol=self.symbol,
+                positions=positions,
+                pnl=round(report.total_pnl, 2),
+                win_rate=round(self.risk_manager.win_rate * 100, 2),
+                trades=self.risk_manager.total_trades,
+                capital=round(report.current_capital, 2),
+            )
+        except Exception:
+            self.logger.exception("Impossible de mettre à jour le registre d'instance")
 
     def _log_status(self) -> None:
         """Affiche le statut périodique."""
@@ -400,6 +614,12 @@ class PaperTradingLive:
         self.telegram.stop()
         await self.telegram.send_message("🛑 *Bot arrete* — rapport final ci-dessous.")
 
+        # Unregister instance
+        try:
+            unregister_instance(pid=os.getpid())
+        except Exception:
+            self.logger.exception("Impossible de desinscrire l'instance du registre")
+
         await self.public_client.disconnect()
         await self.trading_client.disconnect()
 
@@ -422,6 +642,133 @@ class PaperTradingLive:
 
     def stop(self) -> None:
         self._running = False
+        self._paused = False
+
+
+class MultiProcessLauncher:
+    """Lance des instances separées du script en arrière-plan pour chaque symbole.
+
+    Utilise des processus distincts (subprocess) afin d'isoler les instances
+    (évite de dupliquer les WebSocket et le polling Telegram dans le même
+    processus). La commande Telegram attend la forme:
+        /run SYM1,SYM2,...
+    Exemple: `/run EURUSD,1HZ75V`
+    """
+
+    def __init__(self, config: Config, logger):
+        self.config = config
+        self.logger = logger
+
+    def handle_run(self, full_text: str) -> str:
+        parts = full_text.split(None, 1)
+        if len(parts) < 2 or not parts[1].strip():
+            return "Usage: /run SYM1,SYM2,... (ex: /run EURUSD,1HZ75V)"
+        syms_text = parts[1]
+        syms = [s.strip() for s in syms_text.replace(';', ',').split(',') if s.strip()]
+        started = []
+        script = Path(__file__).resolve()
+        for sym in syms:
+            # Resolve labels (ex: "Volatility 75" or "EUR/USD") to canonical codes
+            try:
+                resolved = resolve_symbol(sym)
+            except Exception:
+                resolved = sym.strip().upper()
+            cmd = [sys.executable, str(script), "--symbol", resolved]
+            try:
+                env = dict(**os.environ)
+                env["TELEGRAM_DISABLE"] = "1"
+                p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+                started.append(f"{sym} -> pid:{p.pid}")
+            except Exception as e:
+                err = f"{sym} -> error: {e}"
+                self.logger.error(f"Echec demarrage {sym}: {e}")
+                started.append(err)
+        if not started:
+            return "Aucun symbole demarre."
+        return "Demarre: " + ", ".join(started)
+
+    def handle_choose(self, full_text: str) -> str:
+        """Selection numerique et lancement par index du catalogue.
+
+        Usage:
+          /choose           -> renvoie la liste numerotee des marches
+          /choose 1,3,5     -> lance les items 1,3,5
+          /choose 2-4       -> lance la plage 2 à 4
+        """
+        parts = full_text.split(None, 1)
+        entries = list(MARKET_CATALOG.items())
+        if len(parts) < 2 or not parts[1].strip():
+            # Retourner la liste numerotee
+            lines = [f"{i}) {label}: {code}" for i, (label, code) in enumerate(entries, start=1)]
+            return "Liste des marchés:\n" + "\n".join(lines)
+
+        sel = parts[1].strip()
+        # Allow either numeric indices or symbol names/codes (comma-separated).
+        tokens = [t.strip() for t in sel.replace(';', ',').split(',') if t.strip()]
+
+        # If any token contains letters or non-digit chars (excluding '-'), treat all tokens as symbols
+        treat_as_symbols = any(any(c.isalpha() for c in tok) for tok in tokens)
+
+        to_launch: list[tuple[str, str]] = []  # (label, code)
+
+        if treat_as_symbols:
+            # Interpret tokens as symbol names/codes
+            for tok in tokens:
+                try:
+                    resolved = resolve_symbol(tok)
+                    to_launch.append((tok, resolved))
+                except Exception:
+                    # fallback to uppercase token as code
+                    to_launch.append((tok, tok.strip().upper()))
+        else:
+            # Interpret as indices / ranges
+            indices: list[int] = []
+            for tok in tokens:
+                if '-' in tok:
+                    try:
+                        a, b = tok.split('-', 1)
+                        a_i = int(a)
+                        b_i = int(b)
+                        if a_i <= 0 or b_i <= 0:
+                            return "Indices doivent etre des entiers positifs"
+                        indices.extend(range(a_i, b_i + 1))
+                    except Exception:
+                        return f"Format invalide pour la plage: {tok}"
+                else:
+                    try:
+                        idx = int(tok)
+                        if idx <= 0:
+                            return "Indices doivent etre des entiers positifs"
+                        indices.append(idx)
+                    except Exception:
+                        return f"Index invalide: {tok}"
+
+            # Dédupliquer et valider
+            indices = sorted(set(indices))
+            max_idx = len(entries)
+            for idx in indices:
+                if idx < 1 or idx > max_idx:
+                    return f"Index hors limite: {idx} (1-{max_idx})"
+                label, code = entries[idx - 1]
+                to_launch.append((label, code))
+
+        # Lancer et collecter résultats
+        results = []
+        script = Path(__file__).resolve()
+        for label, code in to_launch:
+            cmd = [sys.executable, str(script), "--symbol", code]
+            try:
+                env = dict(**os.environ)
+                env["TELEGRAM_DISABLE"] = "1"
+                p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+                results.append(f"{label} ({code}) -> pid:{p.pid}")
+            except Exception as e:
+                self.logger.error(f"Echec demarrage {label} ({code}): {e}")
+                results.append(f"{label} ({code}) -> error: {e}")
+
+        if not results:
+            return "Aucun symbole demarre."
+        return "Resultats:\n" + "\n".join(results)
 
 
 async def main():
@@ -440,6 +787,11 @@ async def main():
     symbol = args.symbol or config.market_symbol
 
     engine = PaperTradingLive(config, symbol)
+    # Lanceur pour démarrer d'autres instances du script via Telegram (/run)
+    launcher = MultiProcessLauncher(config, engine.logger)
+    engine.telegram.register_command("/run", launcher.handle_run)
+    engine.telegram.register_command("/markets", lambda: "\n".join(list_markets()))
+    engine.telegram.register_command("/choose", launcher.handle_choose)
 
     # Gestion Ctrl+C (Windows)
     loop = asyncio.get_event_loop()

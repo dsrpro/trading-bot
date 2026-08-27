@@ -208,7 +208,7 @@ class Backtester:
                     amount = position["amount"]
 
                     if hit_tp:
-                        pnl = amount * self.config.risk_reward_ratio
+                        pnl = amount * self._reward_multiple(position)
                     else:
                         pnl = -amount
 
@@ -277,6 +277,17 @@ class Backtester:
         )
 
         return result
+
+    def _reward_multiple(self, position: dict) -> float:
+        """Calcule le multiple de gain depuis les niveaux SL/TP de la position."""
+        entry_price = float(position.get("entry_price", 0.0) or 0.0)
+        stop_loss = float(position.get("sl", 0.0) or 0.0)
+        take_profit = float(position.get("tp", 0.0) or 0.0)
+        risk_distance = abs(entry_price - stop_loss)
+        reward_distance = abs(take_profit - entry_price)
+        if risk_distance > 0 and reward_distance > 0:
+            return reward_distance / risk_distance
+        return self.config.risk_reward_ratio
 
     def generate_sample_data(self, n_candles: int = 1000, volatility: float = 0.002,
                              trend: float = 0.0002, include_regimes: bool = True) -> list[Candle]:
