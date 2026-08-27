@@ -36,16 +36,23 @@ class TelegramManager:
     # Descriptions affichees dans le menu "/" du chat via setMyCommands.
     COMMAND_DESCRIPTIONS = {
         "/help": "Liste des commandes",
-        "/start": "Demarrer le bot",
-        "/run": "Demarrer sur un ou plusieurs symboles",
-        "/markets": "Lister les marchés disponibles",
+        "/symbols": "Prix et positions par symbole",
+        "/positions": "Contrats ouverts en cours",
         "/status": "Etat actuel du bot",
         "/report": "Rapport de risque",
-        "/kill": "Arret d'urgence (kill switch)",
-        "/resume": "Desactive le kill switch",
+        "/daily": "Bilan du jour",
+        "/config": "Configuration courante",
+        "/balance": "Solde reel du compte",
+        "/pause": "Suspendre les nouveaux ordres",
+        "/resume": "Reprendre le trading",
+        "/markets": "Lister les marches disponibles",
         "/stop": "Arret propre du bot",
-        "/choose": "Selectionner par index",
         "/reset": "Reinitialiser les compteurs du jour",
+        # Commandes heritees (autres modules) — conservees par compatibilite
+        "/start": "Demarrer le bot",
+        "/run": "Demarrer sur un ou plusieurs symboles",
+        "/kill": "Arret d'urgence (kill switch)",
+        "/choose": "Selectionner par index",
     }
 
     def __init__(
@@ -84,6 +91,10 @@ class TelegramManager:
         chaine, celle-ci est renvoyee par message Telegram.
         """
         self._command_handlers[command.lower()] = handler
+
+    def registered_commands(self) -> list[str]:
+        """Liste des commandes enregistrees (pour le menu /help)."""
+        return list(self._command_handlers.keys())
 
     async def sync_bot_commands(self) -> bool:
         """Declare les commandes aupres de Telegram (setMyCommands).

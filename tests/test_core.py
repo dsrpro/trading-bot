@@ -532,7 +532,10 @@ class TestRiskManager:
         )
         can, report = risk_manager.can_place_trade(signal)
         assert not can
-        assert risk_manager.is_kill_switch_active
+        # Le stop-loss journalier verrouille le trading jusqu'au lendemain,
+        # mais n'active PAS le kill switch (reserve au drawdown maximum).
+        assert report.status == RiskStatus.DAILY_LOSS_LIMIT_REACHED
+        assert not risk_manager.is_kill_switch_active
 
     def test_daily_profit_target(self, risk_manager):
         # Simuler un profit de 4.1% via on_trade_closed

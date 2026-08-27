@@ -20,6 +20,7 @@ from src.data_streamer import Tick
 from src.deriv_client import DerivClient
 from src.indicators import Indicators
 from src.logger import setup_logger
+from src.markets import list_markets
 from src.order_executor import OrderExecutor
 from src.risk_manager import RiskManager, RiskStatus
 from src.strategy_engine import SignalDirection, StrategyEngine, TradingSignal
@@ -82,7 +83,9 @@ class MultiSymbolScalper:
         )
 
         self._running = False
+        self._paused = False
         self._start_time: float = 0.0
+        self._last_heartbeat_ts: float = time.time()
 
         # Enregistrer les commandes Telegram
         if self.telegram.enabled:
@@ -90,6 +93,15 @@ class MultiSymbolScalper:
             self.telegram.register_command("/report", self._cmd_telegram_report)
             self.telegram.register_command("/stop", self._cmd_telegram_stop)
             self.telegram.register_command("/reset", self._cmd_telegram_reset)
+            self.telegram.register_command("/help", self._cmd_telegram_help)
+            self.telegram.register_command("/symbols", self._cmd_telegram_symbols)
+            self.telegram.register_command("/positions", self._cmd_telegram_positions)
+            self.telegram.register_command("/config", self._cmd_telegram_config)
+            self.telegram.register_command("/daily", self._cmd_telegram_daily)
+            self.telegram.register_command("/balance", self._cmd_telegram_balance)
+            self.telegram.register_command("/pause", self._cmd_telegram_pause)
+            self.telegram.register_command("/resume", self._cmd_telegram_resume)
+            self.telegram.register_command("/markets", self._cmd_telegram_markets)
 
     def _on_deriv_tick(self, tick_data: dict) -> None:
         """Callback appele pour chaque tick de marche recu en direct depuis l'API Deriv."""
@@ -97,6 +109,19 @@ class MultiSymbolScalper:
         if symbol and symbol in self.contexts:
             tick = Tick.from_deriv(tick_data, symbol)
             self.contexts[symbol].candle_builder.process_tick(tick)
+
+    def _has_open_position(self, symbol: str) -> bool:
+        """True si un contrat est encore ouvert pour ce symbole."""
+        return any(o.symbol == symbol for o in self.executor.active_orders)
+
+    def _last_price(self, ctx: SymbolContext) -> str:
+        """Dernier prix connu pour un contexte (close de la bougie courante)."""
+        candle = ctx.candle_builder.current_candle
+        if candle is not None:
+            return f"{candle.close:.5f}"
+        if len(ctx.candle_builder.candles) > 0:
+            return f"{ctx.candle_builder.candles[-1].close:.5f}"
+        return "—"
 
     async def run(self, duration_minutes: Optional[int] = None) -> dict:
         """Execute la boucle principale de scalping.
@@ -239,8 +264,20 @@ class MultiSymbolScalper:
                     signal = ctx.engine.evaluate(current_candle=candle)
 
                     if signal.is_valid:
-                        can_trade, risk_rep = self.risk_manager.can_place_trade(signal)
-                        if can_trade:
+                        # Garde de securite: ne pas empiler plusieurs contrats sur
+                        # le meme symbole tant qu'un est encore ouvert. Et respecter
+                        # la pause demandee via Telegram.
+                        if self._has_open_position(sym):
+                            self.logger.debug(f"Signal ignore pour {sym}: contrat deja ouvert.")
+                            can_trade = False
+                            risk_rep = None
+                        elif self._paused:
+                            can_trade = False
+                            risk_rep = None
+                        else:
+                            can_trade, risk_rep = self.risk_manager.can_place_trade(signal)
+
+                        if can_trade and risk_rep is not None:
                             order = await self.executor.execute_signal(signal, risk_rep.position_size)
                             if order:
                                 self.risk_manager.on_trade_opened(order.amount)
@@ -287,6 +324,18 @@ class MultiSymbolScalper:
                         f"Trades={rep.trades_today}/{rep.max_trades_per_day} | Capital=${rep.current_capital:.2f}"
                     )
 
+                # Heartbeat Telegram toutes les 15 minutes
+                if self.telegram.enabled and time.time() - self._last_heartbeat_ts >= 900.0:
+                    self._last_heartbeat_ts = time.time()
+                    rep = self.risk_manager.get_report()
+                    asyncio.create_task(self.telegram.send_message(
+                        f"❤️ *HEARTBEAT*\n"
+                        f"Symboles: {len(self.symbols)} | PnL jour: `${rep.daily_pnl:+.2f}`\n"
+                        f"Trades: {rep.trades_today}/{rep.max_trades_per_day} | "
+                        f"Capital: `${rep.current_capital:.2f}` | "
+                        f"Statut: `{rep.status.value}` | Pause: {'OUI' if self._paused else 'NON'}"
+                    ))
+
                 await asyncio.sleep(0.5)
 
         except asyncio.CancelledError:
@@ -332,6 +381,90 @@ class MultiSymbolScalper:
             "Compteurs P&L et trades remis à zéro.\n"
             "Le trading peut reprendre."
         )
+
+    def _cmd_telegram_help(self, text: str = "") -> str:
+        desc = self.telegram.COMMAND_DESCRIPTIONS
+        lines = ["🤖 *COMMANDES DISPONIBLES*", ""]
+        for cmd in self.telegram.registered_commands():
+            lines.append(f"{cmd} — {desc.get(cmd, '')}")
+        lines.append("")
+        lines.append("Exemple: /status, /symbols, /positions, /pause, /resume, /balance")
+        return "\n".join(lines)
+
+    def _cmd_telegram_symbols(self, text: str = "") -> str:
+        lines = ["📈 *SYMBOLES SURVEILLES*", ""]
+        for sym, ctx in self.contexts.items():
+            marker = "🔓" if self._has_open_position(sym) else "🟢"
+            lines.append(f"{marker} `{sym}`: {self._last_price(ctx)}")
+        lines.append("")
+        lines.append(f"Pause: {'OUI' if self._paused else 'NON'} | Ouverts: {len(self.executor.active_orders)}")
+        return "\n".join(lines)
+
+    def _cmd_telegram_positions(self, text: str = "") -> str:
+        active = self.executor.active_orders
+        if not active:
+            return "📭 *Aucune position ouverte.*"
+        lines = ["📌 *POSITIONS OUVERTES*", ""]
+        for o in active:
+            icon = "🟢" if o.direction.value == "CALL" else "🔴"
+            cid = o.contract_id or "simulation"
+            lines.append(f"{icon} `{o.symbol}` {o.direction.value} @ {o.entry_price:.5f} | ${o.amount:.2f} | `{cid}`")
+        return "\n".join(lines)
+
+    def _cmd_telegram_config(self, text: str = "") -> str:
+        c = self.config
+        return (
+            "⚙️ *CONFIGURATION*\n"
+            f"Mode: `{c.mode}` | Symboles: {len(self.symbols)}\n"
+            f"Objectif/jour: ${c.daily_profit_target_usd:.2f} | Stop-loss: ${c.daily_stop_loss_usd:.2f}\n"
+            f"Risk/trade: {c.risk_per_trade_pct}% | Max trades/jour: {c.max_trades_per_day}\n"
+            f"Max stake: ${c.max_stake_usd:.2f} | Min stake: ${c.min_stake:.2f}\n"
+            f"Pause: {'OUI' if self._paused else 'NON'}"
+        )
+
+    def _cmd_telegram_daily(self, text: str = "") -> str:
+        rep = self.risk_manager.get_report()
+        return (
+            "📅 *BILAN DU JOUR*\n"
+            f"PnL: ${rep.daily_pnl:+.2f} / ${self.config.daily_profit_target_usd:.2f}\n"
+            f"Trades: {rep.trades_today}/{rep.max_trades_per_day}\n"
+            f"Win Rate: {self.risk_manager.win_rate * 100:.1f}%\n"
+            f"Capital: ${rep.current_capital:.2f}\n"
+            f"Statut: `{rep.status.value}`"
+        )
+
+    async def _cmd_telegram_balance(self, text: str = "") -> str:
+        if not (self.deriv_client and self.deriv_client.is_connected):
+            return f"ℹ️ Client Deriv non connecte. Solde simule: ${self.risk_manager.get_report().current_capital:.2f}"
+        try:
+            res = await self.deriv_client.get_balance()
+            bal_obj = res.get("balance") if isinstance(res, dict) else None
+            if isinstance(bal_obj, dict):
+                bal = bal_obj.get("balance")
+                cur = bal_obj.get("currency", "USD")
+            elif isinstance(bal_obj, (int, float)):
+                bal = float(bal_obj)
+                cur = "USD"
+            else:
+                return "⚠️ Impossible de lire le solde: format inattendu"
+            return f"💳 *SOLDE REEL* | {float(bal):.2f} {cur}"
+        except Exception as e:
+            self.logger.error(f"Erreur lecture solde: {e}", exc_info=True)
+            return f"⚠️ Erreur lecture solde: {e}"
+
+    def _cmd_telegram_pause(self, text: str = "") -> str:
+        self._paused = True
+        return "⏸️ *TRADING SUSPENDU*\nAucun nouveau contrat ne sera ouvert. Les positions en cours restent suivies. `/resume` pour reprendre."
+
+    def _cmd_telegram_resume(self, text: str = "") -> str:
+        self._paused = False
+        return "▶️ *TRADING REPRIS*\nLes nouveaux signaux sont a nouveau executes."
+
+    def _cmd_telegram_markets(self, text: str = "") -> str:
+        lines = ["🗂️ *MARCHES DISPONIBLES*", ""]
+        for line in list_markets():
+            lines.append(line)
+        return "\n".join(lines)
 
     async def _preload_all_candles(self) -> None:
         """Genere ou charge des bougies initiales pour chaque symbole (API ou simulation)."""
