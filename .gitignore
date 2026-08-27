@@ -1,0 +1,25 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# --- Logs ---
+logs/
+*.log
+
+# --- État / runtime ---
+runtime/
+
+# --- Tests / cache ---
+.pytest_cache/
+.coverage
+htmlcov/
+
+# --- OS / Éditeur ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
