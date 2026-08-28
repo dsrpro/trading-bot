@@ -6,6 +6,13 @@ __pycache__/
 venv/
 env/
 
+# --- Secrets / configuration locale (NE JAMAIS COMMITER) ---
+config/settings.env
+config/*.env
+*.env
+.env
+.env.*
+
 # --- Logs ---
 logs/
 *.log
